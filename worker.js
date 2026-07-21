@@ -10,7 +10,7 @@ const MIME_TYPES = {
   flac: 'audio/flac', m4a: 'audio/mp4', ogg: 'audio/ogg', aac: 'audio/aac',
 };
 
-const DEFAULT_CHANNELS = ['-1003967652604', '-1002502061360', '-1003916531716'];
+const DEFAULT_CHANNELS = ['-1003916531716', '-1002502061360', '-1003967652604', '-1002708448330'];
 
 export default {
   async fetch(request, env, ctx) {

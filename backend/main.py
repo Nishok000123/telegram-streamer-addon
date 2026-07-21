@@ -40,7 +40,7 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
 WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.nishokroshan076632.workers.dev").rstrip("/")
 ALLOWED_CHANNELS = [
     c.strip()
-    for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",")
+    for c in os.environ.get("ALLOWED_CHANNELS", "-1003916531716,-1002502061360,-1003967652604,-1002708448330").split(",")
     if c.strip()
 ]
 
