@@ -493,16 +493,16 @@ async def _bot_handle_inline(inline_query: dict):
 
 # ── FASTAPI ENDPOINTS ─────────────────────────────────────────────────────────
 
-@app.on_event("startup")
-async def startup():
+async def _boot_telegram():
+    """Connect Telegram AFTER uvicorn is listening so Koyeb health checks pass."""
+    global BOT_USERNAME, BOT_LINK
+
     if tg_client:
         try:
             await tg_client.start()
             mode = "USER SESSION" if SESSION_STRING else "BOT TOKEN"
             print(f"✅ Telegram connected via {mode}")
 
-            # Warm the peer cache by fetching dialogs — populates storage with peer info
-            # This helps resolve_peer() find channels by their internal peer ID
             try:
                 async for _ in tg_client.get_dialogs(limit=200):
                     pass
@@ -510,31 +510,22 @@ async def startup():
             except Exception as e:
                 print(f"⚠️  Could not warm dialog cache: {e}")
 
-            # Resolve peers so Pyrogram caches them — required before any search/get_chat_history call
             resolved = 0
             for ch in ALLOWED_CHANNELS:
                 try:
                     chat = await tg_client.get_chat(int(ch))
                     print(f"✅ Peer resolved: {ch} → {chat.title}")
                     resolved += 1
-                except ValueError as e:
-                    if "Peer id invalid" in str(e):
-                        print(f"⚠️  Peer {ch} rejected by Pyrogram's MIN_CHANNEL_ID threshold.")
-                        print(f"    → Upgrade pyrogram>=2.1.32 or ensure your account has joined this channel.")
-                    else:
-                        print(f"⚠️  Could not resolve peer {ch}: {e}")
                 except Exception as e:
                     print(f"⚠️  Could not resolve peer {ch}: {e}")
 
             if resolved:
                 print(f"✅ {resolved}/{len(ALLOWED_CHANNELS)} channels resolved successfully")
             else:
-                print(f"⚠️  No channels were resolved. Searches and streaming will likely fail.")
-
+                print("⚠️  No channels were resolved. Searches and streaming will likely fail.")
         except Exception as e:
-            print(f"❌ Startup error: {e}")
+            print(f"❌ Telegram user-session startup error: {e}")
 
-    global BOT_USERNAME, BOT_LINK
     if BOT_TOKEN:
         try:
             me = bot_api("getMe")
@@ -573,6 +564,14 @@ async def startup():
             print(f"❌ Bot webhook startup error: {e}")
     else:
         print("⚠️  Bot commands disabled (set BOT_TOKEN to enable)")
+
+
+@app.on_event("startup")
+async def startup():
+    # Return immediately so the HTTP port opens; Telegram boot runs in background.
+    # Otherwise Koyeb TCP health checks fail during long Pyrogram connect.
+    asyncio.create_task(_boot_telegram())
+    print("✅ HTTP ready (Telegram boot running in background)")
 
 
 @app.on_event("shutdown")
