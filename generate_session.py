@@ -7,7 +7,7 @@ Requirements:
 """
 
 import asyncio
-from hydrogram import Client
+from pyrogram import Client
 
 API_ID = int(input("Enter your API_ID: ").strip())
 API_HASH = input("Enter your API_HASH: ").strip()

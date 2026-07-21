@@ -3,12 +3,12 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from hydrogram import Client, filters
-from hydrogram.types import (
+from pyrogram import Client, filters
+from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, Message,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent
 )
-from hydrogram.errors import FloodWait, ChannelPrivate, MessageIdInvalid
+from pyrogram.errors import FloodWait, ChannelPrivate, MessageIdInvalid
 
 API_ID_RAW = os.environ.get("API_ID", "").strip()
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
