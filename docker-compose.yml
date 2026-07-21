@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  # 1. High-Speed MTProto Telegram Direct Streaming Backend
+  tg-stream-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tg_stream_backend
+    restart: always
+    ports:
+      - "7860:7860"
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - BOT_TOKEN=${BOT_TOKEN}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 2. (Optional) Local C++ Telegram Bot API Server
+  # Uncomment if you want to run local bot api server instead of MTProto python backend
+  # telegram-bot-api:
+  #   image: aiogram/telegram-bot-api:latest
+  #   container_name: telegram_bot_api
+  #   restart: always
+  #   ports:
+  #     - "8081:8081"
+  #   environment:
+  #     - TELEGRAM_API_ID=${API_ID}
+  #     - TELEGRAM_API_HASH=${API_HASH}
+  #   command: ["--local"]
