@@ -2,16 +2,12 @@ name = "telegram-streamer-addon"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-[[r2_buckets]]
-binding = "MEDIA_BUCKET"
-bucket_name = "darkwave-media"
+# Free Workers KV (no card). Create in Dashboard then bind as MEDIA_META,
+# OR uncomment after: npx wrangler kv namespace create MEDIA_META
+# [[kv_namespaces]]
+# binding = "MEDIA_META"
+# id = "YOUR_KV_ID"
 
 [vars]
-# Live Koyeb MTProto Backend Engine
 TELEGRAM_API_URL = "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app"
-
-# Whitelisted Source Channels (must match backend ALLOWED_CHANNELS)
 ALLOWED_CHANNELS = "-1003916531716,-1002502061360,-1003967652604,-1002708448330"
-
-# Optional: set INDEX_SECRET in Cloudflare dashboard + Koyeb to protect admin routes
-# INDEX_SECRET = "change-me"

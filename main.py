@@ -625,13 +625,13 @@ async def _bot_send_index_item(chat_id: int, item: dict):
         parse_mode="Markdown",
         reply_markup=_ikb([[
             {"text": "▶️ Stream", "url": stream_url},
-            {"text": "🔥 Prewarm R2", "callback_data": f"pw:{ch}:{mid}"},
+            {"text": "💾 Cache", "callback_data": f"pw:{ch}:{mid}"},
         ]]),
     )
 
 
 async def _push_index_to_worker():
-    """POST category bundle to Worker so R2/index stays warm."""
+    """POST category bundle to Worker (KV mirror if bound)."""
     try:
         body = build_category_bundle()
         body["items"] = MEDIA_INDEX.get("items") or []
@@ -646,21 +646,40 @@ async def _push_index_to_worker():
         print(f"⚠️  push index to worker failed: {e}")
 
 
-async def _request_worker_prewarm(channel_id: str, message_id: str):
+async def _request_worker_prewarm(channel_id: str, message_id: str, file_name: str = None):
     try:
+        payload = {"channel_id": str(channel_id), "message_id": int(message_id), "max_mb": 128}
+        if file_name:
+            payload["file_name"] = file_name
         r = await asyncio.to_thread(
             requests.post,
             f"{WORKER_URL}/admin/prewarm",
-            json={"channel_id": str(channel_id), "message_id": int(message_id)},
+            json=payload,
             headers={"X-Index-Secret": INDEX_SECRET} if INDEX_SECRET else {},
-            timeout=120,
+            timeout=180,
         )
-        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
+        data = r.json() if "json" in (r.headers.get("content-type") or "") else {"raw": r.text}
         if r.ok and data.get("ok"):
-            return True, f"Cached `{channel_id}:{message_id}` on R2 ({data.get('bytes', '?')} bytes)"
-        return False, f"Prewarm failed: `{data}`"
+            mode = data.get("mode", "head")
+            mb = round((data.get("bytes_warmed") or data.get("bytes") or 0) / (1024 * 1024), 1)
+            note = data.get("note") or ""
+            return True, f"Cached `{channel_id}:{message_id}` ({mb} MiB, {mode}). {note}"
+        return False, f"Cache failed: `{data}`"
     except Exception as e:
-        return False, f"Prewarm error: `{e}`"
+        return False, f"Cache error: `{e}`"
+
+
+async def _request_cached_list():
+    try:
+        r = await asyncio.to_thread(
+            requests.get,
+            f"{WORKER_URL}/admin/cached",
+            headers={"X-Index-Secret": INDEX_SECRET} if INDEX_SECRET else {},
+            timeout=30,
+        )
+        return r.json() if r.ok else {"ok": False, "items": []}
+    except Exception:
+        return {"ok": False, "items": []}
 
 
 async def _bot_handle_callback(callback: dict):
@@ -669,12 +688,12 @@ async def _bot_handle_callback(callback: dict):
     msg = callback.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     if cq_id:
-        await bot_api("answerCallbackQuery", callback_query_id=cq_id, text="Prewarming…")
+        await bot_api("answerCallbackQuery", callback_query_id=cq_id, text="Caching…")
     if data.startswith("pw:") and chat_id:
         parts = data.split(":")
         if len(parts) >= 3:
             ch, mid = parts[1], parts[2]
-            await bot_api("sendMessage", chat_id=chat_id, text=f"🔥 Prewarming `{ch}:{mid}`…", parse_mode="Markdown")
+            await bot_api("sendMessage", chat_id=chat_id, text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB)…", parse_mode="Markdown")
             ok, detail = await _request_worker_prewarm(ch, mid)
             await bot_api("sendMessage", chat_id=chat_id, text=("✅ " if ok else "❌ ") + detail, parse_mode="Markdown")
 
@@ -712,7 +731,8 @@ async def _bot_handle_message(message: dict):
                 "• `/english` — latest English\n"
                 "• `/english popular` — popular English\n"
                 "• `/multi` — multi/dual audio\n"
-                "• `/prewarm <ch:msg>` — cache title to R2\n"
+                "• `/cache <ch:msg>` — cache movie before watch\n"
+                "• `/cached` — list cached titles\n"
                 "• `/index` — rebuild library index\n"
                 "• `/search <title>` — live search\n"
                 "• `/channels` — source channels"
@@ -734,10 +754,11 @@ async def _bot_handle_message(message: dict):
             text=(
                 "📖 **How to use:**\n\n"
                 "1. `/tamil` / `/english` — browse indexed lists (fast)\n"
-                "2. Tap **🔥 Prewarm** to cache a title on R2 for fast stream\n"
-                "3. `/search Avengers` — live channel search\n"
-                f"4. Inline: `{uname} movie title`\n"
-                "5. `/index` — refresh library index from channels"
+                "2. Tap **💾 Cache** before watch (warms first ~128 MiB)\n"
+                "3. `/cached` — see what you cached\n"
+                "4. `/search Avengers` — live channel search\n"
+                f"5. Inline: `{uname} movie title`\n"
+                "6. `/index` — refresh library index from channels"
             ),
             parse_mode="Markdown",
         )
@@ -798,23 +819,58 @@ async def _bot_handle_message(message: dict):
             await _bot_send_index_item(chat_id, item)
         return
 
-    if cmd == "/prewarm":
+    if cmd in ("/prewarm", "/cache"):
         target = " ".join(args).strip()
         if not target or ":" not in target:
             await bot_api(
                 "sendMessage",
                 chat_id=chat_id,
-                text="Usage: `/prewarm <channel_id>:<message_id>`\nOr tap 🔥 Prewarm on a listed title.",
+                text=(
+                    "Usage: `/cache <channel_id>:<message_id>`\n"
+                    "Or tap **💾 Cache** on a listed title.\n"
+                    "Caches first ~128 MiB so play starts fast. Rest fills while watching."
+                ),
                 parse_mode="Markdown",
             )
             return
         ch, _, mid = target.partition(":")
-        await bot_api("sendMessage", chat_id=chat_id, text=f"🔥 Prewarming `{ch}:{mid}` to R2…", parse_mode="Markdown")
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB, list stays in KV)…",
+            parse_mode="Markdown",
+        )
         ok, detail = await _request_worker_prewarm(ch.strip(), mid.strip())
         await bot_api(
             "sendMessage",
             chat_id=chat_id,
             text=("✅ " if ok else "❌ ") + detail,
+            parse_mode="Markdown",
+        )
+        return
+
+    if cmd == "/cached":
+        data = await _request_cached_list()
+        items = data.get("items") or []
+        if not items:
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text="📭 Nothing cached yet. Use `/tamil` then tap **💾 Cache**.",
+                parse_mode="Markdown",
+            )
+            return
+        lines = []
+        for it in items[:20]:
+            mid = it.get("id") or "?"
+            name = it.get("file_name") or mid
+            mode = it.get("mode") or "?"
+            mb = round((it.get("bytes_warmed") or 0) / (1024 * 1024), 1)
+            lines.append(f"• `{mid}` — {name[:40]} ({mb} MiB, {mode})")
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"💾 **Cached ({data.get('total', len(items))}):**\n\n" + "\n".join(lines),
             parse_mode="Markdown",
         )
         return
@@ -942,7 +998,9 @@ async def _boot_telegram():
                     {"command": "tamil", "description": "Latest / popular Tamil (+ multi)"},
                     {"command": "english", "description": "Latest / popular English"},
                     {"command": "multi", "description": "Multi / dual audio"},
-                    {"command": "prewarm", "description": "Cache a title to R2"},
+                    {"command": "cache", "description": "Cache a movie before watching"},
+                    {"command": "cached", "description": "List cached movies"},
+                    {"command": "prewarm", "description": "Alias for /cache"},
                     {"command": "index", "description": "Rebuild media index"},
                     {"command": "search", "description": "Search movies/series"},
                     {"command": "channels", "description": "List source channels"},
@@ -1064,8 +1122,8 @@ def bot_info():
         "bot_mode": "webhook",
         "webhook": f"{BACKEND_URL}/telegram/webhook",
         "commands": [
-            "/start", "/tamil", "/english", "/multi", "/prewarm",
-            "/index", "/search <title>", "/channels", "/help",
+            "/start", "/tamil", "/english", "/multi",
+            "/cache", "/cached", "/index", "/search <title>", "/channels", "/help",
         ],
     }
 
