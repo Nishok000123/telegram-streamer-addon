@@ -1,6 +1,6 @@
 /**
- * Cloudflare Worker: Telegram stream proxy + Stremio stream-only addon.
- * No catalog — attaches Telegram sources to Cinemeta titles (tt…).
+ * Cloudflare Worker: Telegram stream proxy + Stremio addon + R2 hot cache.
+ * Index catalogs (Tamil/English/multi) + stream from R2 when prewarmed.
  */
 
 const MIME_TYPES = {
@@ -12,6 +12,8 @@ const MIME_TYPES = {
 
 const DEFAULT_CHANNELS = ['-1003916531716', '-1002502061360', '-1003967652604', '-1002708448330'];
 const CINEMETA = 'https://v3-cinemeta.strem.io';
+const INDEX_KEY = 'index/categories.json';
+const FULL_INDEX_KEY = 'index/full.json';
 
 export default {
   async fetch(request, env, ctx) {
@@ -23,8 +25,8 @@ export default {
         status: 204,
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Range, Authorization',
+          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS, POST',
+          'Access-Control-Allow-Headers': 'Content-Type, Range, Authorization, X-Index-Secret',
           'Access-Control-Max-Age': '86400',
         },
       });
@@ -34,14 +36,33 @@ export default {
 
     if (path === '/manifest.json') return stremioManifest();
 
+    // Admin: sync index / prewarm selected titles into R2
+    if (path === '/admin/index' && request.method === 'POST') {
+      return adminSaveIndex(request, env);
+    }
+    if (path === '/admin/prewarm' && request.method === 'POST') {
+      return adminPrewarm(request, env, ctx);
+    }
+    if (path === '/admin/prewarm-hot' && request.method === 'POST') {
+      return adminPrewarmHot(request, env, ctx);
+    }
+    if (path === '/index/categories') {
+      return serveStoredIndex(env, INDEX_KEY);
+    }
+
+    // Stremio catalogs from index
+    if (path.startsWith('/catalog/')) {
+      return stremioCatalog(path, url, env, origin);
+    }
+
     // Stream sources for Stremio (/stream/movie/tt….json)
     if (path.startsWith('/stream/') && path.endsWith('.json')) {
       return stremioStream(path, env, origin);
     }
 
     // Media proxy (/stream/{channel_id}/{message_id})
-    if (path.startsWith('/stream/')) return mediaProxy(request, env, url, false);
-    if (path.startsWith('/dl/')) return mediaProxy(request, env, url, true);
+    if (path.startsWith('/stream/')) return mediaProxy(request, env, url, false, ctx);
+    if (path.startsWith('/dl/')) return mediaProxy(request, env, url, true, ctx);
 
     return new Response('403 Forbidden', { status: 403 });
   },
@@ -50,14 +71,20 @@ export default {
 function stremioManifest() {
   return new Response(JSON.stringify({
     id: 'io.darkwave.stream',
-    version: '5.0.2',
+    version: '5.1.0',
     name: '🌊 DarkWave Stream',
-    description: 'Telegram stream sources for movies & series — no catalog, sources only.',
+    description: 'Telegram sources + indexed Tamil/English catalogs. R2-cached hot titles.',
     logo: 'https://i.imgur.com/5ZNRcqH.png',
-    resources: ['stream'],
+    resources: ['catalog', 'stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt', 'tg:'],
-    catalogs: [],
+    catalogs: [
+      { type: 'movie', id: 'tamil-latest', name: 'Tamil Latest (+ multi)' },
+      { type: 'movie', id: 'tamil-popular', name: 'Tamil Popular' },
+      { type: 'movie', id: 'english-latest', name: 'English Latest' },
+      { type: 'movie', id: 'english-popular', name: 'English Popular' },
+      { type: 'movie', id: 'multi-audio', name: 'Multi / Dual Audio' },
+    ],
     behaviorHints: { configurable: false, configurationRequired: false },
   }, null, 2), {
     headers: {
@@ -66,6 +93,188 @@ function stremioManifest() {
       'Cache-Control': 'max-age=300',
     },
   });
+}
+
+function checkSecret(request, env) {
+  const need = env.INDEX_SECRET || '';
+  if (!need) return true;
+  const got = request.headers.get('X-Index-Secret') || '';
+  return got === need;
+}
+
+async function adminSaveIndex(request, env) {
+  if (!checkSecret(request, env)) return new Response('Unauthorized', { status: 401 });
+  if (!env.MEDIA_BUCKET) return new Response('R2 MEDIA_BUCKET not bound', { status: 503 });
+  const body = await request.json();
+  const cats = {
+    updated_at: body.updated_at || Math.floor(Date.now() / 1000),
+    total_indexed: body.total_indexed || (body.items || []).length,
+    tamil_latest: body.tamil_latest || [],
+    tamil_popular: body.tamil_popular || [],
+    english_latest: body.english_latest || [],
+    english_popular: body.english_popular || [],
+    multi_audio_latest: body.multi_audio_latest || [],
+    hot_prewarm: body.hot_prewarm || [],
+  };
+  await env.MEDIA_BUCKET.put(INDEX_KEY, JSON.stringify(cats), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+  if (Array.isArray(body.items)) {
+    await env.MEDIA_BUCKET.put(FULL_INDEX_KEY, JSON.stringify({
+      updated_at: cats.updated_at,
+      total: body.items.length,
+      items: body.items,
+    }), { httpMetadata: { contentType: 'application/json' } });
+  }
+  return json({ ok: true, stored: INDEX_KEY, total_indexed: cats.total_indexed });
+}
+
+async function serveStoredIndex(env, key) {
+  if (!env.MEDIA_BUCKET) return json({ error: 'no R2' }, 503);
+  const obj = await env.MEDIA_BUCKET.get(key);
+  if (!obj) return json({ updated_at: 0, hint: 'no index yet — POST /admin/index' });
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=60',
+    },
+  });
+}
+
+function r2MediaKey(channelId, messageId) {
+  return `media/${channelId}/${messageId}`;
+}
+
+async function adminPrewarm(request, env, ctx) {
+  if (!checkSecret(request, env)) return new Response('Unauthorized', { status: 401 });
+  if (!env.MEDIA_BUCKET) return new Response('R2 MEDIA_BUCKET not bound', { status: 503 });
+  const body = await request.json();
+  const channelId = String(body.channel_id || '');
+  const messageId = String(body.message_id || '');
+  const fileName = body.file_name || 'stream.mkv';
+  if (!channelId || !messageId) return json({ ok: false, error: 'channel_id + message_id required' }, 400);
+
+  const result = await prewarmOne(env, channelId, messageId, fileName);
+  return json(result, result.ok ? 200 : 502);
+}
+
+async function adminPrewarmHot(request, env, ctx) {
+  if (!checkSecret(request, env)) return new Response('Unauthorized', { status: 401 });
+  if (!env.MEDIA_BUCKET) return new Response('R2 MEDIA_BUCKET not bound', { status: 503 });
+  const obj = await env.MEDIA_BUCKET.get(INDEX_KEY);
+  if (!obj) return json({ ok: false, error: 'no index' }, 404);
+  const cats = await obj.json();
+  const list = (cats.hot_prewarm || []).slice(0, 20);
+  const results = [];
+  // Sequential to avoid hammering Telegram / Worker subrequest limits
+  for (const item of list) {
+    const r = await prewarmOne(env, item.channel_id, item.message_id, item.file_name);
+    results.push({ id: item.id || `${item.channel_id}:${item.message_id}`, ...r });
+  }
+  return json({ ok: true, count: results.length, results });
+}
+
+async function prewarmOne(env, channelId, messageId, fileName) {
+  const API_BASE = (env.TELEGRAM_API_URL || '').replace(/\/$/, '');
+  if (!API_BASE) return { ok: false, error: 'TELEGRAM_API_URL missing' };
+  const key = r2MediaKey(channelId, messageId);
+  const existing = await env.MEDIA_BUCKET.head(key);
+  if (existing) {
+    return { ok: true, skipped: true, bytes: existing.size, key };
+  }
+  const name = fileName || 'stream.mkv';
+  const downloadUrl = `${API_BASE}/stream/${channelId}/${messageId}?name=${encodeURIComponent(name)}`;
+  try {
+    const upstream = await fetch(downloadUrl);
+    if (!upstream.ok) {
+      return { ok: false, error: `upstream ${upstream.status}` };
+    }
+    const contentType = upstream.headers.get('Content-Type') || guessMime(name);
+    const len = upstream.headers.get('Content-Length');
+    await env.MEDIA_BUCKET.put(key, upstream.body, {
+      httpMetadata: { contentType },
+      customMetadata: {
+        channel_id: String(channelId),
+        message_id: String(messageId),
+        file_name: name,
+        source: 'telegram',
+      },
+    });
+    const head = await env.MEDIA_BUCKET.head(key);
+    return { ok: true, bytes: head?.size || Number(len) || 0, key };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+}
+
+function guessMime(fileName) {
+  const ext = String(fileName).split('.').pop().toLowerCase();
+  return MIME_TYPES[ext] || 'video/x-matroska';
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+async function loadCategories(env) {
+  if (!env.MEDIA_BUCKET) return null;
+  const obj = await env.MEDIA_BUCKET.get(INDEX_KEY);
+  if (!obj) return null;
+  try { return await obj.json(); } catch (_) { return null; }
+}
+
+async function stremioCatalog(path, url, env, origin) {
+  // /catalog/{type}/{id}.json or /catalog/{type}/{id}/search=q.json
+  const parts = path.replace(/\.json$/, '').split('/').filter(Boolean);
+  // ['catalog', type, id, ...]
+  const type = parts[1] || 'movie';
+  let catalogId = parts[2] || '';
+  let search = url.searchParams.get('search') || '';
+  const searchPath = parts.find((p) => p.startsWith('search='));
+  if (searchPath) search = decodeURIComponent(searchPath.slice(7));
+
+  const cats = await loadCategories(env);
+  let items = [];
+  if (cats) {
+    if (catalogId === 'tamil-latest') items = cats.tamil_latest || [];
+    else if (catalogId === 'tamil-popular') items = cats.tamil_popular || [];
+    else if (catalogId === 'english-latest') items = cats.english_latest || [];
+    else if (catalogId === 'english-popular') items = cats.english_popular || [];
+    else if (catalogId === 'multi-audio') items = cats.multi_audio_latest || [];
+  }
+
+  if (search) {
+    const q = search.toLowerCase();
+    items = items.filter((i) => {
+      const fname = (i.file_name || '').toLowerCase();
+      const title = ((i.info || {}).title || '').toLowerCase();
+      return fname.includes(q) || title.includes(q);
+    });
+  }
+
+  const metas = items.slice(0, 100).map((item) => {
+    const info = item.info || {};
+    const langs = (info.languages || []).join(', ');
+    const name = info.title || item.file_name || 'Untitled';
+    return {
+      id: `tg:${item.channel_id}:${item.message_id}`,
+      type: info.media_type === 'series' ? 'series' : 'movie',
+      name,
+      releaseInfo: info.year ? String(info.year) : undefined,
+      poster: (info.tmdb && info.tmdb.poster) || undefined,
+      description: [info.quality, info.source, info.size, langs, info.multi_audio ? 'Multi-audio' : '']
+        .filter(Boolean).join(' · '),
+    };
+  });
+
+  return json({ metas }, 200);
 }
 
 async function stremioStream(path, env, origin) {
@@ -326,7 +535,142 @@ function makeStream(origin, channelId, messageId, name, title, fileName) {
   };
 }
 
-async function mediaProxy(request, env, url, forceDownload) {
+// ── Write-through stream cache (no upload) ───────────────────────────────────
+// First viewer pulls from Telegram via Koyeb; each 1 MiB segment is stored in
+// caches.default. Later viewers / seeks serve from edge when the colo is warm.
+const SEGMENT_SIZE = 1024 * 1024;
+const META_TTL = 86400;     // 24h
+const SEGMENT_TTL = 86400;  // 24h
+
+function parseRange(rangeHeader, fileSize) {
+  let start = 0;
+  let end = fileSize - 1;
+  if (!rangeHeader) return { start, end, isRange: false };
+  try {
+    const unit = rangeHeader.split('=')[0].trim().toLowerCase();
+    if (unit !== 'bytes') return { start, end, isRange: false };
+    const rng = rangeHeader.split('=')[1].trim();
+    const [first, second] = rng.split('-');
+    if (first === '' && second) {
+      const suffix = parseInt(second, 10);
+      start = Math.max(0, fileSize - suffix);
+    } else {
+      start = first ? parseInt(first, 10) : 0;
+      end = second !== undefined && second !== '' ? parseInt(second, 10) : fileSize - 1;
+    }
+    if (Number.isNaN(start) || Number.isNaN(end)) return { start: 0, end: fileSize - 1, isRange: false };
+    end = Math.min(end, fileSize - 1);
+    if (start >= fileSize) return { start, end: fileSize - 1, isRange: true, unsatisfiable: true };
+    if (end < start) end = fileSize - 1;
+    return { start, end, isRange: true };
+  } catch (_) {
+    return { start: 0, end: fileSize - 1, isRange: false };
+  }
+}
+
+function metaCacheKey(channelId, messageId) {
+  return new Request(`https://tg-seg-cache.internal/meta/${channelId}/${messageId}`);
+}
+
+function segCacheKey(channelId, messageId, index) {
+  return new Request(`https://tg-seg-cache.internal/seg/${channelId}/${messageId}/${index}`);
+}
+
+async function resolveUpstreamUrl(API_BASE, BOT_TOKEN, channelId, fileId, allowedChannels) {
+  if (!API_BASE.includes('api.telegram.org')) {
+    return `${API_BASE}/stream/${channelId || allowedChannels[0]}/${fileId}`;
+  }
+  if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
+  const infoRes = await fetch(`${API_BASE}/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  const info = await infoRes.json();
+  if (!info.ok || !info.result?.file_path) throw new Error('File not found');
+  return `${API_BASE}/file/bot${BOT_TOKEN}/${info.result.file_path}`;
+}
+
+async function getFileMeta(downloadUrl, channelId, messageId, mimeFallback, ctx) {
+  const cache = caches.default;
+  const key = metaCacheKey(channelId, messageId);
+  const hit = await cache.match(key);
+  if (hit) {
+    const size = Number(hit.headers.get('X-File-Size') || 0);
+    const type = hit.headers.get('Content-Type') || mimeFallback;
+    if (size > 0) return { fileSize: size, contentType: type, cacheStatus: 'HIT' };
+  }
+
+  const upstream = await fetch(downloadUrl, { method: 'HEAD' });
+  // Some origins reject HEAD — fall back to tiny Range probe
+  let fileSize = 0;
+  let contentType = mimeFallback;
+  if (upstream.ok || upstream.status === 206) {
+    const cr = upstream.headers.get('Content-Range'); // bytes */SIZE or bytes a-b/SIZE
+    const cl = upstream.headers.get('Content-Length');
+    if (cr && cr.includes('/')) {
+      fileSize = parseInt(cr.split('/').pop(), 10) || 0;
+    } else if (cl) {
+      fileSize = parseInt(cl, 10) || 0;
+    }
+    const ut = upstream.headers.get('Content-Type');
+    if (ut && ut.startsWith('video/')) contentType = ut;
+  }
+  if (!fileSize) {
+    const probe = await fetch(downloadUrl, { headers: { Range: 'bytes=0-0' } });
+    const cr = probe.headers.get('Content-Range');
+    if (cr && cr.includes('/')) fileSize = parseInt(cr.split('/').pop(), 10) || 0;
+    const ut = probe.headers.get('Content-Type');
+    if (ut && ut.startsWith('video/')) contentType = ut;
+    // drain body
+    try { await probe.arrayBuffer(); } catch (_) { /* ignore */ }
+  }
+  if (!fileSize) throw new Error('Unknown file size');
+
+  const cached = new Response(null, {
+    status: 200,
+    headers: {
+      'X-File-Size': String(fileSize),
+      'Content-Type': contentType,
+      'Cache-Control': `public, max-age=${META_TTL}`,
+    },
+  });
+  ctx.waitUntil(cache.put(key, cached.clone()));
+  return { fileSize, contentType, cacheStatus: 'MISS' };
+}
+
+async function getSegment(downloadUrl, channelId, messageId, index, fileSize, contentType, ctx) {
+  const cache = caches.default;
+  const key = segCacheKey(channelId, messageId, index);
+  const hit = await cache.match(key);
+  if (hit) {
+    return { buf: new Uint8Array(await hit.arrayBuffer()), cacheStatus: 'HIT' };
+  }
+
+  const start = index * SEGMENT_SIZE;
+  if (start >= fileSize) return { buf: new Uint8Array(0), cacheStatus: 'MISS' };
+  const end = Math.min(start + SEGMENT_SIZE - 1, fileSize - 1);
+
+  const upstream = await fetch(downloadUrl, {
+    headers: { Range: `bytes=${start}-${end}` },
+  });
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new Error(`Upstream segment error: ${upstream.status}`);
+  }
+  const buf = new Uint8Array(await upstream.arrayBuffer());
+  const toStore = new Response(buf, {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Length': String(buf.byteLength),
+      'Cache-Control': `public, max-age=${SEGMENT_TTL}`,
+      'X-Segment-Index': String(index),
+    },
+  });
+  // Await put so the segment is durable before we move on; also register waitUntil.
+  const put = cache.put(key, toStore.clone());
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(put);
+  await put;
+  return { buf, cacheStatus: 'MISS' };
+}
+
+async function mediaProxy(request, env, url, forceDownload, ctx) {
   const API_BASE = (env.TELEGRAM_API_URL || 'https://api.telegram.org').replace(/\/$/, '');
   const BOT_TOKEN = env.TELEGRAM_BOT_TOKEN;
 
@@ -349,62 +693,229 @@ async function mediaProxy(request, env, url, forceDownload) {
 
   if (!fileId) return new Response('Missing file_id', { status: 400 });
 
+  const bypass = url.searchParams.get('nocache') === '1';
+
   try {
-    let downloadUrl;
-    if (!API_BASE.includes('api.telegram.org')) {
-      downloadUrl = `${API_BASE}/stream/${channelId || allowedChannels[0]}/${fileId}`;
-    } else {
-      if (!BOT_TOKEN) return new Response('BOT_TOKEN missing', { status: 500 });
-      const infoRes = await fetch(`${API_BASE}/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
-      const info = await infoRes.json();
-      if (!info.ok || !info.result?.file_path) return new Response('File not found', { status: 404 });
-      downloadUrl = `${API_BASE}/file/bot${BOT_TOKEN}/${info.result.file_path}`;
+    // R2 hot path — prewarmed full file
+    if (!bypass && env.MEDIA_BUCKET && channelId) {
+      const key = r2MediaKey(channelId, fileId);
+      const head = await env.MEDIA_BUCKET.head(key);
+      if (head) {
+        return serveR2WithRange(request, env, key, head, fileName, mimeType, forceDownload);
+      }
     }
 
-    const rangeHeader = request.headers.get('Range');
-    const upstreamHeaders = {};
-    if (rangeHeader) upstreamHeaders.Range = rangeHeader;
+    const downloadUrl = await resolveUpstreamUrl(
+      API_BASE, BOT_TOKEN, channelId, fileId, allowedChannels
+    );
 
-    const upstream = await fetch(downloadUrl, {
-      method: request.method === 'HEAD' ? 'HEAD' : 'GET',
-      headers: upstreamHeaders,
-    });
-
-    if (!upstream.ok && upstream.status !== 206) {
-      return new Response(`Upstream error: ${upstream.status}`, { status: upstream.status });
+    if (bypass) {
+      return passthroughProxy(request, downloadUrl, fileName, mimeType, forceDownload);
     }
 
-    const upstreamType = upstream.headers.get('Content-Type');
-    const contentType = (upstreamType && upstreamType.startsWith('video/'))
-      ? upstreamType
-      : mimeType;
-
-    const resHeaders = new Headers({
-      'Access-Control-Allow-Origin': '*',
-      'Accept-Ranges': 'bytes',
-      'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=3600',
-      'CF-Cache-Status': 'DYNAMIC',
-      'Content-Disposition': forceDownload
-        ? `attachment; filename="${encodeURIComponent(fileName)}"`
-        : `inline; filename="${encodeURIComponent(fileName)}"`,
-    });
-
-    if (upstream.headers.has('Content-Length')) {
-      resHeaders.set('Content-Length', upstream.headers.get('Content-Length'));
-    }
-    if (upstream.headers.has('Content-Range')) {
-      resHeaders.set('Content-Range', upstream.headers.get('Content-Range'));
-    }
-
-    const status = upstream.status === 206 ? 206 : (rangeHeader && upstream.ok ? 206 : upstream.status);
-
-    if (request.method === 'HEAD') {
-      return new Response(null, { status, headers: resHeaders });
-    }
-
-    return new Response(upstream.body, { status, headers: resHeaders });
+    return serveCachedStream(
+      request,
+      downloadUrl,
+      channelId || allowedChannels[0],
+      fileId,
+      fileName,
+      mimeType,
+      forceDownload,
+      ctx
+    );
   } catch (err) {
     return new Response(`Error: ${err.message}`, { status: 500 });
   }
+}
+
+async function serveR2Object(request, obj, fileName, mimeType, forceDownload, key) {
+  const contentType = obj.httpMetadata?.contentType || mimeType;
+  const headers = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Accept-Ranges': 'bytes',
+    'Content-Type': contentType,
+    'Cache-Control': 'public, max-age=86400',
+    'X-Cache': 'R2',
+    'CF-Cache-Status': 'HIT',
+    'Content-Disposition': forceDownload
+      ? `attachment; filename="${encodeURIComponent(fileName)}"`
+      : `inline; filename="${encodeURIComponent(fileName)}"`,
+  });
+  if (obj.size != null) headers.set('Content-Length', String(obj.size));
+  if (request.method === 'HEAD') {
+    return new Response(null, { status: 200, headers });
+  }
+  return new Response(obj.body, { status: 200, headers });
+}
+
+async function serveR2WithRange(request, env, key, head, fileName, mimeType, forceDownload) {
+  const fileSize = head.size;
+  const contentType = head.httpMetadata?.contentType || mimeType;
+  const rangeHeader = request.headers.get('Range');
+  const { start, end, isRange, unsatisfiable } = parseRange(rangeHeader, fileSize);
+
+  if (unsatisfiable) {
+    return new Response(null, {
+      status: 416,
+      headers: {
+        'Content-Range': `bytes */${fileSize}`,
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+
+  const length = end - start + 1;
+  const status = isRange ? 206 : 200;
+  const headers = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Accept-Ranges': 'bytes',
+    'Content-Type': contentType,
+    'Content-Length': String(length),
+    'Cache-Control': 'public, max-age=86400',
+    'X-Cache': 'R2',
+    'CF-Cache-Status': 'HIT',
+    'Content-Disposition': forceDownload
+      ? `attachment; filename="${encodeURIComponent(fileName)}"`
+      : `inline; filename="${encodeURIComponent(fileName)}"`,
+  });
+  if (isRange) headers.set('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+
+  if (request.method === 'HEAD') {
+    return new Response(null, { status, headers });
+  }
+
+  const obj = await env.MEDIA_BUCKET.get(key, {
+    range: isRange ? { offset: start, length } : undefined,
+  });
+  if (!obj) return new Response('R2 object missing', { status: 404 });
+  return new Response(obj.body, { status, headers });
+}
+
+async function passthroughProxy(request, downloadUrl, fileName, mimeType, forceDownload) {
+  const rangeHeader = request.headers.get('Range');
+  const upstreamHeaders = {};
+  if (rangeHeader) upstreamHeaders.Range = rangeHeader;
+  const upstream = await fetch(downloadUrl, {
+    method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+    headers: upstreamHeaders,
+  });
+  if (!upstream.ok && upstream.status !== 206) {
+    return new Response(`Upstream error: ${upstream.status}`, { status: upstream.status });
+  }
+  const upstreamType = upstream.headers.get('Content-Type');
+  const contentType = (upstreamType && upstreamType.startsWith('video/')) ? upstreamType : mimeType;
+  const resHeaders = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Accept-Ranges': 'bytes',
+    'Content-Type': contentType,
+    'Cache-Control': 'no-store',
+    'CF-Cache-Status': 'BYPASS',
+    'Content-Disposition': forceDownload
+      ? `attachment; filename="${encodeURIComponent(fileName)}"`
+      : `inline; filename="${encodeURIComponent(fileName)}"`,
+  });
+  if (upstream.headers.has('Content-Length')) {
+    resHeaders.set('Content-Length', upstream.headers.get('Content-Length'));
+  }
+  if (upstream.headers.has('Content-Range')) {
+    resHeaders.set('Content-Range', upstream.headers.get('Content-Range'));
+  }
+  const status = upstream.status === 206 ? 206 : (rangeHeader && upstream.ok ? 206 : upstream.status);
+  if (request.method === 'HEAD') return new Response(null, { status, headers: resHeaders });
+  return new Response(upstream.body, { status, headers: resHeaders });
+}
+
+async function serveCachedStream(request, downloadUrl, channelId, messageId, fileName, mimeType, forceDownload, ctx) {
+  const wait = ctx && typeof ctx.waitUntil === 'function'
+    ? (p) => ctx.waitUntil(p)
+    : (p) => p; // still await puts inline when no ctx
+  const fakeCtx = { waitUntil: wait };
+
+  const meta = await getFileMeta(downloadUrl, channelId, messageId, mimeType, fakeCtx);
+  const { fileSize, contentType } = meta;
+  const rangeHeader = request.headers.get('Range');
+  const { start, end, isRange, unsatisfiable } = parseRange(rangeHeader, fileSize);
+
+  if (unsatisfiable) {
+    return new Response(null, {
+      status: 416,
+      headers: {
+        'Content-Range': `bytes */${fileSize}`,
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+
+  const length = end - start + 1;
+  const status = isRange ? 206 : 200;
+
+  // Peek first segment to know HIT/MISS for response header (also warms start of stream)
+  const firstIdx = Math.floor(start / SEGMENT_SIZE);
+  const firstSeg = await getSegment(downloadUrl, channelId, messageId, firstIdx, fileSize, contentType, fakeCtx);
+  const cacheStatus = firstSeg.cacheStatus;
+
+  const resHeaders = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Accept-Ranges': 'bytes',
+    'Content-Type': contentType,
+    'Content-Length': String(length),
+    'Cache-Control': 'public, max-age=3600',
+    'CF-Cache-Status': cacheStatus,
+    'X-Cache': cacheStatus,
+    'Content-Disposition': forceDownload
+      ? `attachment; filename="${encodeURIComponent(fileName)}"`
+      : `inline; filename="${encodeURIComponent(fileName)}"`,
+  });
+  if (isRange) {
+    resHeaders.set('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+  }
+
+  if (request.method === 'HEAD') {
+    return new Response(null, { status, headers: resHeaders });
+  }
+
+  // Stream: emit already-fetched first segment slice, then continue
+  let seg = firstIdx;
+  const last = Math.floor(end / SEGMENT_SIZE);
+  let firstBuf = firstSeg.buf;
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        while (seg <= last) {
+          let buf = firstBuf;
+          firstBuf = null;
+          if (!buf) {
+            const got = await getSegment(
+              downloadUrl, channelId, messageId, seg, fileSize, contentType, fakeCtx
+            );
+            buf = got.buf;
+          }
+          if (!buf.byteLength) {
+            controller.close();
+            return;
+          }
+          const segStart = seg * SEGMENT_SIZE;
+          const from = Math.max(0, start - segStart);
+          const to = Math.min(buf.byteLength, end - segStart + 1);
+          if (to > from) controller.enqueue(buf.subarray(from, to));
+
+          // Prefetch next segment while client drains this one
+          if (seg + 1 <= last) {
+            fakeCtx.waitUntil(
+              getSegment(downloadUrl, channelId, messageId, seg + 1, fileSize, contentType, fakeCtx)
+                .catch(() => null)
+            );
+          }
+          seg += 1;
+          return; // one segment per pull — backpressure friendly
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+  });
+
+  return new Response(stream, { status, headers: resHeaders });
 }
