@@ -16,7 +16,7 @@ WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.nisho
 
 ALLOWED_CHANNELS = [c.strip() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
 
-app = FastAPI(title="Telegram Streamer MTProto Engine & Bot Interface", version="3.0.0")
+app = FastAPI(title="Telegram Streamer MTProto Engine & Bot Interface", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,15 +28,18 @@ app.add_middleware(
 
 tg_client = None
 if API_ID > 0 and API_HASH and BOT_TOKEN:
-    tg_client = Client(
-        "tg_streamer_engine",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True
-    )
+    try:
+        tg_client = Client(
+            "tg_streamer_engine",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            in_memory=True
+        )
+    except Exception as init_err:
+        print(f"❌ Hydrogram Client Init Error: {init_err}")
 else:
-    print("⚠️ WARNING: API_ID, API_HASH, or BOT_TOKEN missing!")
+    print(f"⚠️ Missing Credentials Config -> API_ID_VALID: {API_ID > 0}, API_HASH_SET: {bool(API_HASH)}, BOT_TOKEN_SET: {bool(BOT_TOKEN)}")
 
 def parse_media_info(file_name: str, file_size: int):
     name_lower = file_name.lower()
@@ -241,9 +244,15 @@ def health_check():
     return {
         "status": "online",
         "engine": "Hydrogram MTProto Direct Streamer & Telegram Bot Interface",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "worker_url": WORKER_URL,
-        "bot_active": tg_client is not None,
+        "credentials_configured": tg_client is not None,
+        "diagnostics": {
+            "api_id_valid": API_ID > 0,
+            "api_id_raw_len": len(API_ID_RAW),
+            "api_hash_present": bool(API_HASH),
+            "bot_token_present": bool(BOT_TOKEN)
+        },
         "channels": ALLOWED_CHANNELS
     }
 
@@ -257,7 +266,7 @@ def health():
 @app.get("/search")
 async def search_channels(q: str = Query(..., min_length=2), channel_id: str = None):
     if not tg_client:
-        raise HTTPException(status_code=500, detail="Telegram credentials missing.")
+        raise HTTPException(status_code=500, detail="Telegram credentials missing or invalid.")
 
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
@@ -286,7 +295,7 @@ async def search_channels(q: str = Query(..., min_length=2), channel_id: str = N
 @app.get("/recent")
 async def get_recent_media(channel_id: str = None, limit: int = 20):
     if not tg_client:
-        return {"total": 0, "items": [], "warning": "Credentials missing"}
+        return {"total": 0, "items": [], "warning": "Credentials missing or invalid"}
 
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
@@ -315,7 +324,7 @@ async def get_recent_media(channel_id: str = None, limit: int = 20):
 @app.get("/stream/{channel_id}/{message_id}")
 async def stream_media(channel_id: str, message_id: int, request: Request):
     if not tg_client:
-        raise HTTPException(status_code=500, detail="Telegram credentials missing.")
+        raise HTTPException(status_code=500, detail="Telegram credentials missing or invalid.")
 
     retry_count = 0
     max_retries = 3
