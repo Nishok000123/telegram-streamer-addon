@@ -1,34 +1,84 @@
 # Telegram Streamer & Stremio Addon
 
-Direct, high-speed streamable link generator and Stremio v3 Addon powered by Telegram Source Channels, Cloudflare Edge Caching, and Hugging Face MTProto streaming backend.
+Stream videos from whitelisted Telegram channels into Stremio / VLC / browsers via byte-range links.
+
+**Stack today:** Telegram MTProto (Pyrogram) on **Koyeb** + **Cloudflare Worker** (Stremio addon, Cache API, optional KV). No Hugging Face required. No R2 / no payment card required for the free path.
 
 ## Features
-- **Byte-Range Media Streaming (`206 Partial Content`)**: Instant seek and scrub support for video players (Stremio, Infuse, VLC, Web browsers).
-- **Unlimited File Sizes (Up to 2GB/4GB)**: Powered by Hugging Face / MTProto fast streaming backend bypassing the 20MB standard Bot API limit.
-- **Stremio Addon Protocol v3**: Built-in `/manifest.json` and `/stream` endpoints with 1-click `stremio://` installer.
-- **Whitelisted Source Channels**: Protects bandwidth by restricting access to specified channel IDs (`-1003967652604`, `-1002502061360`, `-1003916531716`).
 
----
+- **Byte-range streaming (`206`)** — seek/scrub in Stremio, Infuse, VLC, browsers
+- **Large files (2GB / 4GB)** — MTProto user session, not Bot API 20MB limit
+- **Stremio addon** — `/manifest.json`, catalogs, `/stream` sources
+- **Media index** — scan channels once; browse Tamil / English / multi-audio without live search every time
+- **Bot** — `/tamil`, `/english`, `/multi`, `/cache`, `/cached`, `/search`, `/index`
+- **Pre-watch cache** — `/cache` warms ~128 MiB into Cloudflare Cache API; list stays in free Workers KV
+- **Channel allowlist** — only configured channel IDs are streamable
 
-## Deployment Guide
+Default channels:
 
-### 1. Deploy Free MTProto Backend (Hugging Face Spaces)
-1. Create a free Docker Space at [huggingface.co/new-space](https://huggingface.co/new-space).
-2. Upload the contents of the `backend/` directory (`Dockerfile`, `main.py`, `requirements.txt`).
-3. Add Environment Secrets in Space Settings:
-   - `API_ID`
-   - `API_HASH`
-   - `BOT_TOKEN`
-4. Copy your Space URL (e.g. `https://USERNAME-tg-stream-backend.hf.space`).
+`-1003916531716`, `-1002502061360`, `-1003967652604`, `-1002708448330`
 
-### 2. Deploy Cloudflare Worker (Frontend & Addon)
-1. Deploy `worker.js` to Cloudflare Workers (or use `npx wrangler deploy`).
-2. Set Environment Variables:
-   - `TELEGRAM_API_URL` = `https://USERNAME-tg-stream-backend.hf.space`
-   - `TELEGRAM_BOT_TOKEN` = `YOUR_BOT_TOKEN`
-   - `ALLOWED_CHANNELS` = `-1003967652604,-1002502061360,-1003916531716`
+## Honest limits
 
----
+- First play of an uncached title is limited by **Telegram** speed (one download lock per backend client — not multi-session parallel)
+- Cache API can evict under pressure; `/cached` list in KV still stays and re-warms on next play
+- Cloudflare Worker is mainly addon + edge segment cache — not a full CDN of your whole library
+
+## Deploy
+
+### 1. Backend (Koyeb / Docker)
+
+Env (Koyeb):
+
+| Var | Notes |
+|-----|--------|
+| `API_ID` / `API_HASH` | [my.telegram.org](https://my.telegram.org) |
+| `SESSION_STRING` | Preferred (full channel access) |
+| `BOT_TOKEN` | Bot commands via webhook |
+| `BACKEND_URL` | Public Koyeb URL |
+| `WORKER_URL` | Cloudflare Worker URL |
+| `ALLOWED_CHANNELS` | Comma-separated channel IDs |
+| `INDEX_SECRET` | Optional; protect `/index/rebuild` |
+
+```bash
+# local
+docker compose up --build
+# or: uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Health: `GET /` · `GET /health` · Bot: `GET /bot`
+
+### 2. Cloudflare Worker
+
+1. Deploy `worker.js` (`npx wrangler deploy` or paste in dashboard)
+2. Vars: `TELEGRAM_API_URL` = Koyeb URL, `ALLOWED_CHANNELS` = same list
+3. Optional free **KV** binding name: `MEDIA_META` (keeps `/cached` list)
+4. **Do not need R2** (R2 requires a payment method)
+
+```bash
+npx wrangler deploy
+```
+
+Worker URL example: `https://telegram-streamer-addon.<you>.workers.dev`
+
+Install in Stremio: open `/manifest.json` → install addon.
+
+### 3. First-time use
+
+1. Merge/deploy backend → wait for Telegram connect  
+2. In bot: `/index`  
+3. `/tamil` or `/english` → tap **💾 Cache** before watch (optional)  
+4. **Stream** or play from Stremio catalogs  
+
+## Useful API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /index/rebuild` | Rescan channels into index |
+| `GET /index/categories` | Tamil/English/multi lists |
+| `GET /search?q=` | Search (index first, else Telegram) |
+| `GET /stream/{channel}/{msg}` | Byte-range media |
 
 ## License
+
 MIT
