@@ -4,7 +4,7 @@ import asyncio
 import time
 import requests
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -55,6 +55,11 @@ ALLOWED_CHANNELS = [
 
 app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Pyrogram get_file is not safe under concurrent streams on one client —
+# interleaved chunks blow past Content-Length ("Too much data for declared Content-Length").
+DOWNLOAD_SEM = asyncio.Semaphore(1)
+CHUNK_SIZE = 1024 * 1024
 
 # Use SESSION_STRING (user account) if available, else fall back to BOT_TOKEN
 tg_client = None
@@ -554,6 +559,36 @@ async def tmdb_search_api(q: str = Query(..., min_length=2), year: int = None, m
         raise HTTPException(404, "No match found.")
     return data
 
+async def _read_telegram_range(msg, start: int, length: int):
+    """Yield exact byte range from Telegram. offset/limit are 1 MiB chunk indices."""
+    offset_chunks = start // CHUNK_SIZE
+    skip_front = start % CHUNK_SIZE
+    # +1 spare chunk — hard byte-cap below stops early; avoids short reads on odd sizes
+    limit_chunks = (skip_front + length + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    sent = 0
+    trim = skip_front
+    async with DOWNLOAD_SEM:
+        async for raw in tg_client.stream_media(
+            msg, offset=offset_chunks, limit=limit_chunks
+        ):
+            chunk = bytes(raw)
+            if trim:
+                if trim >= len(chunk):
+                    trim -= len(chunk)
+                    continue
+                chunk = chunk[trim:]
+                trim = 0
+            if sent + len(chunk) > length:
+                chunk = chunk[: length - sent]
+            if not chunk:
+                break
+            sent += len(chunk)
+            yield chunk
+            if sent >= length:
+                break
+
+
 @app.api_route("/stream/{channel_id}/{message_id}", methods=["GET", "HEAD"])
 async def stream_api(channel_id: str, message_id: int, request: Request):
     if not tg_client:
@@ -573,27 +608,72 @@ async def stream_api(channel_id: str, message_id: int, request: Request):
                 raise HTTPException(404, "No streamable media in message.")
 
             file_size = media.file_size
+            if not file_size or file_size <= 0:
+                raise HTTPException(404, "Media has unknown size.")
             mime = getattr(media, "mime_type", "video/mp4")
             range_hdr = request.headers.get("range")
             start, end = 0, file_size - 1
             if range_hdr:
-                parts = range_hdr.replace("bytes=", "").split("-")
-                start = int(parts[0])
-                if len(parts) > 1 and parts[1]:
-                    end = int(parts[1])
+                try:
+                    unit, _, rng = range_hdr.partition("=")
+                    if unit.strip().lower() != "bytes":
+                        raise ValueError("unsupported range unit")
+                    first, _, second = rng.strip().partition("-")
+                    if first == "" and second:
+                        suffix = int(second)
+                        start = max(0, file_size - suffix)
+                    else:
+                        start = int(first) if first else 0
+                        end = int(second) if second else file_size - 1
+                except ValueError:
+                    raise HTTPException(416, "Invalid Range header")
+                if start >= file_size:
+                    return Response(status_code=416, headers={
+                        "Content-Range": f"bytes */{file_size}",
+                        "Access-Control-Allow-Origin": "*",
+                    })
+                end = min(end, file_size - 1)
+                if end < start:
+                    end = file_size - 1
 
-            async def gen():
-                async for chunk in tg_client.stream_media(msg, offset=start, limit=(end - start + 1)):
-                    yield chunk
-
-            return StreamingResponse(gen(), status_code=206 if range_hdr else 200, headers={
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
+            length = end - start + 1
+            headers = {
                 "Accept-Ranges": "bytes",
-                "Content-Length": str(end - start + 1),
+                "Content-Length": str(length),
                 "Content-Type": mime,
                 "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=31536000",
-            })
+                "Cache-Control": "public, max-age=3600",
+            }
+            if range_hdr:
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            status = 206 if range_hdr else 200
+
+            # HEAD only needs size/range metadata — do not touch Telegram download.
+            if request.method == "HEAD":
+                return Response(status_code=status, headers=headers)
+
+            # Small probes (Stremio/VLC Range bytes=0-1 etc): buffer exact body.
+            # Avoids StreamingResponse + Content-Length races under FloodWait.
+            if length <= CHUNK_SIZE:
+                buf = bytearray()
+                try:
+                    async for piece in _read_telegram_range(msg, start, length):
+                        buf.extend(piece)
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value)
+                    continue
+                return Response(bytes(buf[:length]), status_code=status, headers=headers)
+
+            async def gen(s=start, n=length):
+                try:
+                    async for piece in _read_telegram_range(msg, s, n):
+                        yield piece
+                except FloodWait as fw:
+                    print(f"FloodWait during stream: {fw.value}s")
+                except Exception as e:
+                    print(f"Stream body error: {e}")
+
+            return StreamingResponse(gen(), status_code=status, headers=headers)
         except FloodWait as fw:
             await asyncio.sleep(fw.value)
         except HTTPException:

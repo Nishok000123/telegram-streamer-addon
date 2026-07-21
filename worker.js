@@ -75,15 +75,10 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 
   if (!fileId) return new Response('Missing file_id', { status: 400 });
 
-  // Check edge cache
-  const cache = caches.default;
-  const cacheKey = new Request(request.url, { headers: request.headers, method: 'GET' });
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    const h = new Headers(cached.headers);
-    h.set('CF-Cache-Status', 'HIT');
-    return new Response(cached.body, { status: cached.status, headers: h });
-  }
+  // Do NOT use caches.default for media:
+  // - HEAD / empty upstream bodies were being stored as GET with Content-Length: 0
+  // - Stremio always sends Range; a poisoned 0-byte object yields 416 bytes */0
+  // - Multi-GB videos are a poor fit for the Cache API anyway
 
   try {
     let downloadUrl;
@@ -100,9 +95,12 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
     }
 
     const rangeHeader = request.headers.get('Range');
+    const upstreamHeaders = {};
+    if (rangeHeader) upstreamHeaders['Range'] = rangeHeader;
+
     const upstream = await fetch(downloadUrl, {
-      method: request.method,
-      headers: rangeHeader ? { Range: rangeHeader } : {},
+      method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+      headers: upstreamHeaders,
     });
 
     if (!upstream.ok && upstream.status !== 206) {
@@ -113,8 +111,9 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
       'Access-Control-Allow-Origin': '*',
       'Accept-Ranges': 'bytes',
       'Content-Type': mimeType,
-      'Cache-Control': 'public, max-age=31536000, immutable',
-      'CF-Cache-Status': 'MISS',
+      // Short TTL only — never immutable year-long for seekable video
+      'Cache-Control': 'public, max-age=60',
+      'CF-Cache-Status': 'DYNAMIC',
       'Content-Disposition': forceDownload
         ? `attachment; filename="${encodeURIComponent(fileName)}"`
         : `inline; filename="${encodeURIComponent(fileName)}"`,
@@ -123,10 +122,14 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
     if (upstream.headers.has('Content-Length')) resHeaders.set('Content-Length', upstream.headers.get('Content-Length'));
     if (upstream.headers.has('Content-Range')) resHeaders.set('Content-Range', upstream.headers.get('Content-Range'));
 
-    const status = (upstream.status === 206 || rangeHeader) ? 206 : 200;
-    const response = new Response(upstream.body, { status, headers: resHeaders });
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    return response;
+    const status = upstream.status === 206 ? 206 : (rangeHeader && upstream.ok ? 206 : upstream.status);
+
+    // HEAD must not attach a body (and must not invent one from upstream).
+    if (request.method === 'HEAD') {
+      return new Response(null, { status, headers: resHeaders });
+    }
+
+    return new Response(upstream.body, { status, headers: resHeaders });
 
   } catch (err) {
     return new Response(`Error: ${err.message}`, { status: 500 });
@@ -136,7 +139,7 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 function stremioManifest(origin) {
   return new Response(JSON.stringify({
     id: 'io.darkwave.stream',
-    version: '4.5.0',
+    version: '4.5.1',
     name: '🌊 DarkWave Stream',
     description: 'Private high-speed streaming from curated Telegram sources — powered by MTProto & Cloudflare Edge.',
     logo: 'https://i.imgur.com/5ZNRcqH.png',
