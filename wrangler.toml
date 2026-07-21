@@ -3,9 +3,8 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 
 [vars]
-# Custom MTProto Backend URL (e.g., HuggingFace Space or custom VPS)
-# Set to https://YOUR_USERNAME-tg-stream-backend.hf.space
-TELEGRAM_API_URL = "https://api.telegram.org"
+# Live Koyeb MTProto Backend Engine
+TELEGRAM_API_URL = "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app"
 
 # Whitelisted Source Channels
 ALLOWED_CHANNELS = "-1003967652604,-1002502061360,-1003916531716"
