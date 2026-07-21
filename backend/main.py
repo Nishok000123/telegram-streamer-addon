@@ -559,34 +559,40 @@ async def tmdb_search_api(q: str = Query(..., min_length=2), year: int = None, m
         raise HTTPException(404, "No match found.")
     return data
 
+async def _fetch_one_chunk(msg, chunk_index: int) -> bytes:
+    """Fetch a single 1 MiB Telegram chunk under the download lock, then release."""
+    async with DOWNLOAD_SEM:
+        async for raw in tg_client.stream_media(msg, offset=chunk_index, limit=1):
+            return bytes(raw)
+    return b""
+
+
 async def _read_telegram_range(msg, start: int, length: int):
-    """Yield exact byte range from Telegram. offset/limit are 1 MiB chunk indices."""
+    """Yield exact byte range. Lock only per Telegram chunk so seeks are not blocked."""
     offset_chunks = start // CHUNK_SIZE
     skip_front = start % CHUNK_SIZE
-    # +1 spare chunk — hard byte-cap below stops early; avoids short reads on odd sizes
     limit_chunks = (skip_front + length + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     sent = 0
     trim = skip_front
-    async with DOWNLOAD_SEM:
-        async for raw in tg_client.stream_media(
-            msg, offset=offset_chunks, limit=limit_chunks
-        ):
-            chunk = bytes(raw)
-            if trim:
-                if trim >= len(chunk):
-                    trim -= len(chunk)
-                    continue
-                chunk = chunk[trim:]
-                trim = 0
-            if sent + len(chunk) > length:
-                chunk = chunk[: length - sent]
-            if not chunk:
-                break
-            sent += len(chunk)
-            yield chunk
-            if sent >= length:
-                break
+    for i in range(limit_chunks):
+        chunk = await _fetch_one_chunk(msg, offset_chunks + i)
+        if not chunk:
+            break
+        if trim:
+            if trim >= len(chunk):
+                trim -= len(chunk)
+                continue
+            chunk = chunk[trim:]
+            trim = 0
+        if sent + len(chunk) > length:
+            chunk = chunk[: length - sent]
+        if not chunk:
+            break
+        sent += len(chunk)
+        yield chunk
+        if sent >= length:
+            break
 
 
 @app.api_route("/stream/{channel_id}/{message_id}", methods=["GET", "HEAD"])

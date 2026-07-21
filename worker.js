@@ -107,10 +107,17 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
       return new Response(`Upstream error: ${upstream.status}`, { status: upstream.status });
     }
 
+    // Prefer real Telegram mime (usually video/x-matroska). Stremio used to force
+    // name=stream.mp4 which lied as video/mp4 and broke players on MKV files.
+    const upstreamType = upstream.headers.get('Content-Type');
+    const contentType = (upstreamType && upstreamType.startsWith('video/'))
+      ? upstreamType
+      : mimeType;
+
     const resHeaders = new Headers({
       'Access-Control-Allow-Origin': '*',
       'Accept-Ranges': 'bytes',
-      'Content-Type': mimeType,
+      'Content-Type': contentType,
       // Short TTL only — never immutable year-long for seekable video
       'Cache-Control': 'public, max-age=60',
       'CF-Cache-Status': 'DYNAMIC',
@@ -139,7 +146,7 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 function stremioManifest(origin) {
   return new Response(JSON.stringify({
     id: 'io.darkwave.stream',
-    version: '4.5.1',
+    version: '4.5.2',
     name: '🌊 DarkWave Stream',
     description: 'Private high-speed streaming from curated Telegram sources — powered by MTProto & Cloudflare Edge.',
     logo: 'https://i.imgur.com/5ZNRcqH.png',
@@ -277,12 +284,17 @@ async function stremioStream(path, url, env, origin) {
   if (id.startsWith('tg:')) {
     const parts = id.split(':');
     if (parts.length >= 3) {
-      const streamUrl = `${origin}/stream/${parts[1]}/${parts[2]}?name=stream.mp4`;
+      // Most Telegram sources are MKV; mp4 label lied to players. Mime comes from backend.
+      const streamUrl = `${origin}/stream/${parts[1]}/${parts[2]}?name=stream.mkv`;
       streams.push({
         name: '🌊 DarkWave',
-        title: `Edge Stream | 1080p / 4K`,
+        title: 'Edge Stream | Telegram MTProto',
         url: streamUrl,
-        behaviorHints: { notSupported: false, isFree: true },
+        behaviorHints: {
+          bingeGroup: `darkwave-${parts[1]}-${parts[2]}`,
+          filename: 'stream.mkv',
+          notWebReady: true,
+        },
       });
     }
   }
