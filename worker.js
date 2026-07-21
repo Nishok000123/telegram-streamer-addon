@@ -1,7 +1,6 @@
 /**
  * Cloudflare Worker: Enterprise Telegram Direct Stream Generator & Stremio Addon
- * Optimized for media streaming, edge byte-range caching, Stremio protocol v3,
- * and custom Telegram Bot API / MTProto backend support.
+ * Fully Automated & Zero-Maintenance Engine v2.5
  */
 
 const MIME_TYPES = {
@@ -41,22 +40,37 @@ export default {
 
     const path = url.pathname;
 
+    // 1. Stremio Manifest Endpoint
     if (path === '/manifest.json') {
       return handleStremioManifest(origin);
     }
 
+    // 2. Stremio Catalog Endpoint (/catalog/movie/telegram.json)
+    if (path.startsWith('/catalog/')) {
+      return handleStremioCatalog(path, url, env, origin);
+    }
+
+    // 3. Stremio Stream Endpoint (/stream/movie/id.json)
     if (path.startsWith('/stream/') && path.endsWith('.json')) {
       return handleStremioStreamRequest(path, url, env, origin);
     }
 
+    // 4. API Search Proxy (/api/search?q=...)
+    if (path === '/api/search' || path === '/api/recent') {
+      return handleApiProxy(path, url, env);
+    }
+
+    // 5. Dashboard UI
     if (path === '/' || path === '/configure') {
       return handleDashboardUI(origin, env);
     }
 
+    // 6. Media Stream Proxy Endpoint
     if (path.startsWith('/stream/')) {
       return handleMediaStream(request, env, ctx, url);
     }
 
+    // 7. Direct Download Endpoint
     if (path.startsWith('/dl/')) {
       return handleMediaStream(request, env, ctx, url, true);
     }
@@ -117,8 +131,8 @@ async function handleMediaStream(request, env, ctx, url, forceDownload = false) 
   try {
     let downloadUrl = '';
     
-    // Check if using Hugging Face / Custom Fast API MTProto Backend
-    if (API_BASE.includes('hf.space') || API_BASE.includes('koyeb') || API_BASE.includes('render') || !API_BASE.includes('api.telegram.org')) {
+    // Using MTProto FastAPI Backend (Koyeb / Render / VPS)
+    if (API_BASE.includes('koyeb') || API_BASE.includes('render') || API_BASE.includes('hf.space') || !API_BASE.includes('api.telegram.org')) {
       downloadUrl = `${API_BASE}/stream/${channelId || '-1003967652604'}/${fileId}`;
     } else {
       if (!BOT_TOKEN) {
@@ -126,7 +140,7 @@ async function handleMediaStream(request, env, ctx, url, forceDownload = false) 
       }
       const fileInfoUrl = `${API_BASE}/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`;
       const fileInfoRes = await fetch(fileInfoUrl, {
-        headers: { 'User-Agent': 'Cloudflare-Telegram-Proxy/2.0' },
+        headers: { 'User-Agent': 'Cloudflare-Telegram-Proxy/2.5' },
       });
 
       if (!fileInfoRes.ok) {
@@ -194,13 +208,19 @@ async function handleMediaStream(request, env, ctx, url, forceDownload = false) 
 function handleStremioManifest(origin) {
   const manifest = {
     id: 'org.telegram.direct.streaming.addon',
-    version: '1.0.0',
-    name: 'Telegram Media Direct Streamer',
-    description: 'Direct high-speed video streaming addon backed by Telegram Source Channels & Cloudflare Edge Caching.',
-    resources: ['stream'],
+    version: '2.5.0',
+    name: 'Telegram Media Auto-Streamer',
+    description: 'Automated video streaming addon backed by Telegram Source Channels, Auto Search & Cloudflare Edge Caching.',
+    resources: ['stream', 'catalog'],
     types: ['movie', 'series', 'other'],
     idPrefixes: ['tg:', 'tt'],
-    catalogs: [],
+    catalogs: [
+      {
+        type: 'movie',
+        id: 'telegram-recent-movies',
+        name: 'Telegram Source Movies',
+      },
+    ],
     behaviorHints: {
       configurable: true,
       configurationRequired: false,
@@ -212,6 +232,37 @@ function handleStremioManifest(origin) {
       'Content-Type': 'application/json; charset=utf-8',
       'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'max-age=3600, public',
+    },
+  });
+}
+
+async function handleStremioCatalog(path, url, env, origin) {
+  const API_BASE = (env.TELEGRAM_API_URL || 'https://api.telegram.org').replace(/\/$/, '');
+  let metas = [];
+
+  try {
+    if (API_BASE.includes('koyeb') || API_BASE.includes('render') || API_BASE.includes('hf.space')) {
+      const res = await fetch(`${API_BASE}/recent?limit=20`);
+      if (res.ok) {
+        const data = await res.json();
+        metas = (data.items || []).map((item) => ({
+          id: `tg:${item.channel_id}:${item.message_id}`,
+          type: 'movie',
+          name: item.file_name,
+          poster: 'https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&auto=format&fit=crop&q=60',
+          description: `Quality: ${item.info.quality} | Size: ${item.info.formatted_size} | Audio: ${item.info.audio}`,
+        }));
+      }
+    }
+  } catch (e) {
+    console.log('Catalog fetch error:', e);
+  }
+
+  return new Response(JSON.stringify({ metas }, null, 2), {
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'max-age=300, public',
     },
   });
 }
@@ -243,7 +294,7 @@ async function handleStremioStreamRequest(path, url, env, origin) {
     streams: [
       {
         name: '⚡ Telegram Direct Edge',
-        title: `Direct High-Speed Stream\nChannel: ${channelId} | 1080p/4K Enabled`,
+        title: `Telegram Direct Stream\nChannel: ${channelId} | 1080p/4K Enabled`,
         url: directStreamUrl,
         behaviorHints: {
           notSupported: false,
@@ -262,9 +313,31 @@ async function handleStremioStreamRequest(path, url, env, origin) {
   });
 }
 
+async function handleApiProxy(path, url, env) {
+  const API_BASE = (env.TELEGRAM_API_URL || 'https://api.telegram.org').replace(/\/$/, '');
+  const query = url.searchParams.get('q') || '';
+  
+  try {
+    let targetUrl = `${API_BASE}/recent`;
+    if (path === '/api/search' && query) {
+      targetUrl = `${API_BASE}/search?q=${encodeURIComponent(query)}`;
+    }
+    const res = await fetch(targetUrl);
+    const data = await res.json();
+    return new Response(JSON.stringify(data), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+  }
+}
+
 function handleDashboardUI(origin, env) {
   const allowedChannels = (env.ALLOWED_CHANNELS || DEFAULT_CHANNELS.join(', ')).split(',');
-  const apiStatus = env.TELEGRAM_API_URL ? `Custom API Backend (${env.TELEGRAM_API_URL})` : 'Standard Bot API (20MB Max per file)';
+  const apiStatus = env.TELEGRAM_API_URL ? `Auto Backend (${env.TELEGRAM_API_URL})` : 'Standard Bot API';
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -296,7 +369,7 @@ function handleDashboardUI(origin, env) {
     }
     .container {
       width: 100%;
-      max-width: 900px;
+      max-width: 950px;
       background: var(--card-bg);
       backdrop-filter: blur(16px);
       border: 1px solid var(--border-color);
@@ -377,96 +450,128 @@ function handleDashboardUI(origin, env) {
       word-break: break-all;
       border: 1px solid rgba(0,242,254,0.2);
     }
-    .channel-tag {
-      display: inline-block;
-      background: rgba(255,255,255,0.05);
-      padding: 4px 10px;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      font-family: 'JetBrains Mono', monospace;
-      margin: 4px 2px;
+    .search-item {
+      background: rgba(0,0,0,0.4);
       border: 1px solid var(--border-color);
+      padding: 10px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
+    .tag { font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; background: rgba(0, 242, 254, 0.2); color: var(--accent-cyan); }
     video { width: 100%; border-radius: 12px; margin-top: 1rem; background: #000; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <span class="badge">Cloudflare Edge Proxy v2.0</span>
+      <span class="badge">Zero-Touch Automation Engine v2.5</span>
       <h1>Telegram Streamable Link Generator</h1>
-      <p class="subtitle">Generate high-speed, direct byte-range streamable links & Stremio Addon streams</p>
+      <p class="subtitle">Search, Stream, and Direct-Download from Telegram Source Channels</p>
     </div>
 
     <div class="grid">
       <div class="card">
-        <h3>⚡ Link Generator</h3>
+        <h3>🔍 Auto Channel Movie Search</h3>
+        <input type="text" id="searchInput" placeholder="Type movie title (e.g. Avatar, Inception)..." onkeyup="if(event.key==='Enter') searchChannel()">
+        <button class="btn" onclick="searchChannel()">Search Channels</button>
+        
+        <div id="searchResults" style="margin-top:1rem; max-height:220px; overflow-y:auto;"></div>
+      </div>
+
+      <div class="card">
+        <h3>⚡ Direct Message ID Streamer</h3>
         <form id="genForm" onsubmit="generateLink(event)">
           <label>Source Channel</label>
           <select id="channelSelect">
             ${allowedChannels.map((c) => `<option value="${c.trim()}">${c.trim()}</option>`).join('')}
           </select>
 
-          <label>Message ID (or File ID)</label>
-          <input type="text" id="fileIdInput" placeholder="e.g. 1234 or BQACAg..." required>
+          <label>Message ID (e.g. 1234)</label>
+          <input type="text" id="fileIdInput" placeholder="1234" required>
 
           <label>File Name</label>
           <input type="text" id="fileNameInput" value="movie.mp4">
 
           <button type="submit" class="btn">Generate Direct Stream URL</button>
         </form>
-
-        <div id="outputArea" style="display:none;">
-          <div class="result-box" id="resultUrl"></div>
-          <button class="btn btn-secondary" onclick="copyResult()">📋 Copy Stream Link</button>
-          <button class="btn btn-secondary" onclick="playInBrowser()">▶️ Test Play Video</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>🎬 Stremio Addon Integration</h3>
-        <p style="font-size:0.9rem; color:var(--text-muted); margin-bottom:1rem;">
-          Install into Stremio app to play directly from Telegram!
-        </p>
-
-        <label>Stremio Manifest URL</label>
-        <div class="result-box">${origin}/manifest.json</div>
-        <a href="stremio://${origin.replace(/^https?:\/\//, '')}/manifest.json" class="btn btn-secondary" style="display:block; text-align:center; text-decoration:none; margin-top:10px;">
-          ➕ One-Click Install to Stremio
-        </a>
-
-        <h3 style="margin-top:1.5rem;">⚙️ System Engine</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted);">${apiStatus}</p>
-
-        <label style="margin-top:1rem;">Whitelisted Channels:</label>
-        <div>
-          ${allowedChannels.map((c) => `<span class="channel-tag">${c.trim()}</span>`).join('')}
-        </div>
       </div>
     </div>
 
-    <div id="videoPreviewCard" class="card" style="margin-top:1.5rem; display:none;">
-      <h3>▶️ Live HTML5 Stream Preview</h3>
-      <video id="player" controls playsinline></video>
+    <div class="card" style="margin-top:1.5rem;">
+      <h3>🎬 Stremio Addon Integration</h3>
+      <label>Stremio Manifest URL</label>
+      <div class="result-box">${origin}/manifest.json</div>
+      <a href="stremio://${origin.replace(/^https?:\/\//, '')}/manifest.json" class="btn btn-secondary" style="display:block; text-align:center; text-decoration:none; margin-top:10px;">
+        ➕ One-Click Install to Stremio
+      </a>
+    </div>
+
+    <div id="outputArea" class="card" style="margin-top:1.5rem; display:none;">
+      <h3>🎯 Generated Stream URL</h3>
+      <div class="result-box" id="resultUrl"></div>
+      <button class="btn btn-secondary" onclick="copyResult()">📋 Copy Stream Link</button>
+      <button class="btn btn-secondary" onclick="playInBrowser()">▶️ Test Play Video</button>
+
+      <div id="videoPreviewCard" style="display:none; margin-top:1rem;">
+        <video id="player" controls playsinline></video>
+      </div>
     </div>
   </div>
 
   <script>
+    async function searchChannel() {
+      const q = document.getElementById('searchInput').value.trim();
+      if (!q) return;
+      const resContainer = document.getElementById('searchResults');
+      resContainer.innerHTML = '<div style="color:var(--text-muted);">Searching channels...</div>';
+
+      try {
+        const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+        const data = await res.json();
+        
+        if (!data.results || data.results.length === 0) {
+          resContainer.innerHTML = '<div style="color:var(--text-muted);">No movies found matching query.</div>';
+          return;
+        }
+
+        let html = '';
+        data.results.forEach(item => {
+          const streamUrl = '${origin}/stream/' + item.channel_id + '/' + item.message_id + '?name=' + encodeURIComponent(item.file_name);
+          html += '<div class="search-item">' +
+            '<div>' +
+              '<div style="font-weight:600; font-size:0.9rem;">' + item.file_name + '</div>' +
+              '<div style="margin-top:4px;"><span class="tag">' + item.info.quality + '</span> <span style="font-size:0.8rem; color:var(--text-muted);">' + item.info.formatted_size + '</span></div>' +
+            '</div>' +
+            '<button class="btn" style="width:auto; padding:6px 12px; font-size:0.8rem;" onclick="selectStream(\'' + streamUrl + '\')">Select</button>' +
+          '</div>';
+        });
+        resContainer.innerHTML = html;
+      } catch (e) {
+        resContainer.innerHTML = '<div style="color:red;">Error searching backend.</div>';
+      }
+    }
+
+    function selectStream(url) {
+      document.getElementById('resultUrl').innerText = url;
+      document.getElementById('outputArea').style.display = 'block';
+    }
+
     function generateLink(e) {
       e.preventDefault();
       const channel = document.getElementById('channelSelect').value;
       const fileId = document.getElementById('fileIdInput').value.trim();
-      const fileName = document.getElementById('fileNameInput').value.trim() || 'video.mp4';
+      const fileName = document.getElementById('fileNameInput').value.trim() || 'movie.mp4';
       
       const streamUrl = '${origin}/stream/' + channel + '/' + encodeURIComponent(fileId) + '?name=' + encodeURIComponent(fileName);
-      
-      document.getElementById('resultUrl').innerText = streamUrl;
-      document.getElementById('outputArea').style.display = 'block';
+      selectStream(streamUrl);
     }
 
     function copyResult() {
       navigator.clipboard.writeText(document.getElementById('resultUrl').innerText);
-      alert('Stream link copied!');
+      alert('Stream link copied to clipboard!');
     }
 
     function playInBrowser() {

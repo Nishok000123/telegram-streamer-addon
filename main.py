@@ -10,7 +10,7 @@ from hydrogram.errors import FloodWait, RPCError
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ALLOWED_CHANNELS = [c.strip() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
+ALLOWED_CHANNELS = [c.trim() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
 
 app = FastAPI(title="Telegram Streamer MTProto Engine", version="2.5.0")
 
@@ -59,6 +59,7 @@ def health():
     return {"status": "ok", "connected": tg_client.is_connected if hasattr(tg_client, 'is_connected') else True}
 
 def parse_media_info(file_name: str, file_size: int):
+    """Detect quality tags from file name"""
     name_lower = file_name.lower()
     quality = "720p"
     if "2160p" in name_lower or "4k" in name_lower:
@@ -86,6 +87,7 @@ def parse_media_info(file_name: str, file_size: int):
 
 @app.get("/search")
 async def search_channels(q: str = Query(..., min_length=2), channel_id: str = None):
+    """Auto Search Movies & Media Across Allowed Source Channels"""
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
 
@@ -112,6 +114,7 @@ async def search_channels(q: str = Query(..., min_length=2), channel_id: str = N
 
 @app.get("/recent")
 async def get_recent_media(channel_id: str = None, limit: int = 20):
+    """Auto pull recent uploaded movies from channels"""
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
 
@@ -138,6 +141,7 @@ async def get_recent_media(channel_id: str = None, limit: int = 20):
 
 @app.get("/stream/{channel_id}/{message_id}")
 async def stream_media(channel_id: str, message_id: int, request: Request):
+    """High Speed Partial Byte Range Video Streaming Engine"""
     retry_count = 0
     max_retries = 3
 
@@ -165,6 +169,8 @@ async def stream_media(channel_id: str, message_id: int, request: Request):
                 start = int(bytes_range[0])
                 if len(bytes_range) > 1 and bytes_range[1]:
                     end = int(bytes_range[1])
+
+            chunk_size = 1024 * 1024 # 1MB chunks for fast seeking
 
             async def media_generator():
                 try:
@@ -197,4 +203,4 @@ async def stream_media(channel_id: str, message_id: int, request: Request):
             print(f"Error serving stream {channel_id}/{message_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    raise HTTPException(status_code=429, detail="Telegram Rate Limit Exceeded.")
+    raise HTTPException(status_code=429, detail="Telegram Rate Limit Exceeded. Try again in a few seconds.")
