@@ -53,7 +53,7 @@ ALLOWED_CHANNELS = [
     if c.strip()
 ]
 
-app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.0.0")
+app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Pyrogram get_file is not safe under concurrent streams on one client —
@@ -61,8 +61,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 DOWNLOAD_SEM = asyncio.Semaphore(1)
 CHUNK_SIZE = 1024 * 1024
 
-# Use SESSION_STRING (user account) if available, else fall back to BOT_TOKEN
+# User session = channel search + streaming. Bot token = /commands + inline.
+# SESSION_STRING alone cannot receive bot DMs or inline queries.
 tg_client = None
+bot_client = None
+
 if SESSION_STRING and API_ID and API_HASH:
     print("✅ Using USER SESSION (full channel access, no admin required)")
     tg_client = Client(
@@ -73,7 +76,7 @@ if SESSION_STRING and API_ID and API_HASH:
         in_memory=True,
     )
 elif BOT_TOKEN and API_ID and API_HASH:
-    print("⚠️  Using BOT TOKEN (bot must be admin in each channel)")
+    print("⚠️  Using BOT TOKEN only (bot must be admin / member in each channel)")
     tg_client = Client(
         "tg_bot_session",
         api_id=API_ID,
@@ -84,6 +87,21 @@ elif BOT_TOKEN and API_ID and API_HASH:
 else:
     print("❌ No valid credentials found. Set SESSION_STRING (preferred) or BOT_TOKEN.")
 
+if BOT_TOKEN and API_ID and API_HASH and SESSION_STRING:
+    # Separate bot client so /start, /search, inline work while user session streams.
+    bot_client = Client(
+        "tg_bot_commands",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        in_memory=True,
+    )
+    print("✅ BOT TOKEN also configured (commands + inline enabled)")
+elif SESSION_STRING and not BOT_TOKEN:
+    print("⚠️  BOT_TOKEN missing — Telegram bot commands/inline disabled (Stremio/API still work)")
+elif BOT_TOKEN and not SESSION_STRING:
+    bot_client = tg_client  # same client handles both
+    print("✅ Bot client = primary client (no separate user session)")
 
 # ── Content Parsing ────────────────────────────────────────────────────────────
 
@@ -249,10 +267,15 @@ async def enrich_media_info(info: dict):
 
 
 
-# ── BOT COMMAND HANDLERS ──────────────────────────────────────────────────────
+# ── BOT COMMAND HANDLERS (require bot_client) ─────────────────────────────────
 
-if tg_client:
-    @tg_client.on_message(filters.command("start"))
+def _search_client():
+    """Channel search must use user session when available."""
+    return tg_client
+
+
+if bot_client:
+    @bot_client.on_message(filters.command("start") & filters.private)
     async def cmd_start(client: Client, msg: Message):
         await msg.reply_text(
             "🎬 **Telegram Movie Streamer Bot**\n\n"
@@ -267,26 +290,33 @@ if tg_client:
             disable_web_page_preview=True,
         )
 
-    @tg_client.on_message(filters.command("help"))
+    @bot_client.on_message(filters.command("help") & filters.private)
     async def cmd_help(client: Client, msg: Message):
+        me = await client.get_me()
+        uname = f"@{me.username}" if me and me.username else "@your_bot"
         await msg.reply_text(
             "📖 **How to use:**\n\n"
             "1. `/search Avengers` — search all source channels\n"
             "2. Forward any video from a source channel here to get a stream link\n"
-            "3. Inline: type `@botname movie title` anywhere in Telegram\n"
+            f"3. Inline: type `{uname} movie title` anywhere in Telegram\n"
             "4. Install Stremio Addon via the /start menu"
         )
 
-    @tg_client.on_message(filters.command("channels"))
+    @bot_client.on_message(filters.command("channels") & filters.private)
     async def cmd_channels(client: Client, msg: Message):
         lines = "\n".join(f"• `{ch}`" for ch in ALLOWED_CHANNELS)
         await msg.reply_text(f"📢 **Source Channels:**\n\n{lines}")
 
-    @tg_client.on_message(filters.command("search"))
+    @bot_client.on_message(filters.command("search") & filters.private)
     async def cmd_search(client: Client, msg: Message):
         query = " ".join(msg.command[1:]).strip()
         if not query:
             await msg.reply_text("Usage: `/search <movie title>`")
+            return
+
+        searcher = _search_client()
+        if not searcher:
+            await msg.reply_text("❌ Search backend not connected.")
             return
 
         status = await msg.reply_text(f"🔍 Searching for **{query}**…")
@@ -295,33 +325,27 @@ if tg_client:
         for ch in ALLOWED_CHANNELS:
             try:
                 chat_id = int(ch)
-                async for m in client.search_messages(chat_id, query=query, limit=10):
+                async for m in searcher.search_messages(chat_id, query=query, limit=10):
                     media = m.video or m.document or m.audio
                     if not media:
                         continue
                     found += 1
                     fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
                     info = await enrich_media_info(parse_media_info(fname, media.file_size))
-                    stremio_type = "series" if info.get("media_type") == "series" else "movie"
                     stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
                     dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={fname}"
-                    stremio_url = f"stremio://{WORKER_URL.replace('https://','')}/stream/{stremio_type}/tg:{ch}:{m.id}.json"
 
                     extras = []
                     if info.get("year"):
                         extras.append(f"📅 {info['year']}")
                     if info.get("source") and info["source"] != "Unknown":
                         extras.append(f"📀 {info['source']}")
-                    extras_str = " | ".join(extras)
-                    if extras_str:
-                        extras_str = "\n" + extras_str
+                    extras_str = ("\n" + " | ".join(extras)) if extras else ""
 
                     tmdb_block = ""
                     tmdb = info.get("tmdb")
-                    if tmdb:
-                        rating = tmdb.get("vote_average", "")
-                        rating_str = f"⭐ {rating}/10" if rating else ""
-                        tmdb_block = f"\n{rating_str}" if rating_str else ""
+                    if tmdb and tmdb.get("vote_average"):
+                        tmdb_block = f"\n⭐ {tmdb['vote_average']}/10"
 
                     await msg.reply_text(
                         f"🎬 **{fname}**\n"
@@ -331,8 +355,6 @@ if tg_client:
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton("▶️ Stream", url=stream_url),
                             InlineKeyboardButton("📥 Download", url=dl_url),
-                        ], [
-                            InlineKeyboardButton("🍿 Stremio", url=stremio_url),
                         ]]),
                     )
             except Exception as e:
@@ -343,7 +365,7 @@ if tg_client:
         else:
             await status.edit_text(f"❌ Nothing found for **{query}** in source channels.")
 
-    @tg_client.on_message(filters.media | filters.forwarded)
+    @bot_client.on_message(filters.private & (filters.media | filters.forwarded))
     async def auto_stream_link(client: Client, msg: Message):
         media = msg.video or msg.document or msg.audio
         if not media:
@@ -374,15 +396,20 @@ if tg_client:
             ]]),
         )
 
-    @tg_client.on_inline_query()
+    @bot_client.on_inline_query()
     async def inline_search(client: Client, iq: InlineQuery):
         q = iq.query.strip()
         if len(q) < 2:
+            await iq.answer([], cache_time=5, switch_pm_text="Type a movie title…", switch_pm_parameter="help")
+            return
+        searcher = _search_client()
+        if not searcher:
+            await iq.answer([], cache_time=5)
             return
         results = []
         for ch in ALLOWED_CHANNELS:
             try:
-                async for m in client.search_messages(int(ch), query=q, limit=5):
+                async for m in searcher.search_messages(int(ch), query=q, limit=5):
                     media = m.video or m.document or m.audio
                     if not media:
                         continue
@@ -394,8 +421,8 @@ if tg_client:
                     if info.get("year"):
                         desc = f"{info['year']} · {desc}"
                     results.append(InlineQueryResultArticle(
-                        title=info.get('title') or fname,
-                        description=desc,
+                        title=(info.get('title') or fname)[:64],
+                        description=desc[:120],
                         input_message_content=InputTextMessageContent(
                             f"🎬 **{fname}**\n📌 {info['quality']} | {info.get('source','?')} | 📦 {info['size']}\n🔗 {url}"
                         ),
@@ -405,7 +432,8 @@ if tg_client:
                     ))
             except Exception as e:
                 print(f"Inline error {ch}: {e}")
-        await iq.answer(results[:15], cache_time=300)
+        await iq.answer(results[:15], cache_time=60)
+
 
 
 # ── FASTAPI ENDPOINTS ─────────────────────────────────────────────────────────
@@ -451,25 +479,51 @@ async def startup():
         except Exception as e:
             print(f"❌ Startup error: {e}")
 
+    if bot_client is not None and bot_client is not tg_client:
+        try:
+            await bot_client.start()
+            me = await bot_client.get_me()
+            uname = f"@{me.username}" if me and me.username else "(no username)"
+            print(f"✅ Bot client connected for commands/inline: {uname}")
+        except Exception as e:
+            print(f"❌ Bot client startup error: {e}")
+    elif bot_client is tg_client and bot_client is not None:
+        print("✅ Bot commands enabled on primary client")
+    else:
+        print("⚠️  Bot commands disabled (set BOT_TOKEN to enable)")
+
+
 @app.on_event("shutdown")
 async def shutdown():
+    if bot_client is not None and bot_client is not tg_client and getattr(bot_client, "is_connected", False):
+        await bot_client.stop()
     if tg_client and getattr(tg_client, "is_connected", False):
         await tg_client.stop()
+
 
 @app.get("/")
 def root():
     mode = "user_session" if SESSION_STRING else ("bot_token" if BOT_TOKEN else "none")
     return {
         "status": "online",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "mode": mode,
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
+        "bot": bool(bot_client),
+        "bot_connected": getattr(bot_client, "is_connected", False) if bot_client else False,
         "channels": ALLOWED_CHANNELS,
     }
 
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "connected": getattr(tg_client, "is_connected", False) if tg_client else False}
+    return {
+        "status": "ok",
+        "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
+        "bot": bool(bot_client),
+        "bot_connected": getattr(bot_client, "is_connected", False) if bot_client else False,
+    }
+
 
 @app.get("/search")
 async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, enriched: str = "false"):
