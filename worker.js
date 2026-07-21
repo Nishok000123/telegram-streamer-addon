@@ -1,6 +1,6 @@
 /**
- * Cloudflare Worker: Telegram Direct Stream Proxy & Stremio Addon
- * Private - No public web dashboard. Streams only to authenticated Stremio/VLC clients.
+ * Cloudflare Worker: Telegram stream proxy + Stremio stream-only addon.
+ * No catalog — attaches Telegram sources to Cinemeta titles (tt…).
  */
 
 const MIME_TYPES = {
@@ -11,13 +11,13 @@ const MIME_TYPES = {
 };
 
 const DEFAULT_CHANNELS = ['-1003916531716', '-1002502061360', '-1003967652604', '-1002708448330'];
+const CINEMETA = 'https://v3-cinemeta.strem.io';
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const origin = url.origin;
 
-    // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -32,27 +32,176 @@ export default {
 
     const path = url.pathname;
 
-    // Stremio Manifest
-    if (path === '/manifest.json') return stremioManifest(origin);
+    if (path === '/manifest.json') return stremioManifest();
 
-    // Stremio Catalog
-    if (path.startsWith('/catalog/')) return stremioCatalog(url, env, origin);
+    // Stream sources for Stremio (/stream/movie/tt….json)
+    if (path.startsWith('/stream/') && path.endsWith('.json')) {
+      return stremioStream(path, env, origin);
+    }
 
-    // Stremio Stream endpoint (/stream/movie/tg:channelId:msgId.json)
-    if (path.startsWith('/stream/') && path.endsWith('.json')) return stremioStream(path, url, env, origin);
+    // Media proxy (/stream/{channel_id}/{message_id})
+    if (path.startsWith('/stream/')) return mediaProxy(request, env, url, false);
+    if (path.startsWith('/dl/')) return mediaProxy(request, env, url, true);
 
-    // Media proxy stream (/stream/{channel_id}/{message_id})
-    if (path.startsWith('/stream/')) return mediaProxy(request, env, ctx, url, false);
-
-    // Direct download (/dl/{channel_id}/{message_id})
-    if (path.startsWith('/dl/')) return mediaProxy(request, env, ctx, url, true);
-
-    // Block everything else — no public dashboard
     return new Response('403 Forbidden', { status: 403 });
   },
 };
 
-async function mediaProxy(request, env, ctx, url, forceDownload) {
+function stremioManifest() {
+  return new Response(JSON.stringify({
+    id: 'io.darkwave.stream',
+    version: '5.0.0',
+    name: '🌊 DarkWave Stream',
+    description: 'Telegram stream sources for movies & series — no catalog, sources only.',
+    logo: 'https://i.imgur.com/5ZNRcqH.png',
+    resources: ['stream'],
+    types: ['movie', 'series'],
+    idPrefixes: ['tt', 'tg:'],
+    catalogs: [],
+    behaviorHints: { configurable: false, configurationRequired: false },
+  }, null, 2), {
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'max-age=300',
+    },
+  });
+}
+
+async function stremioStream(path, env, origin) {
+  // /stream/{type}/{id}.json
+  const parts = path.replace(/\.json$/, '').split('/').filter(Boolean);
+  const type = parts[1] || 'movie';
+  const id = decodeURIComponent(parts.slice(2).join('/') || '');
+
+  let streams = [];
+
+  try {
+    if (id.startsWith('tg:')) {
+      streams = streamsFromTgId(id, origin);
+    } else if (id.startsWith('tt')) {
+      streams = await streamsFromImdb(id, type, env, origin);
+    }
+  } catch (e) {
+    console.error('stream error:', e);
+  }
+
+  return new Response(JSON.stringify({ streams }), {
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache',
+    },
+  });
+}
+
+function streamsFromTgId(id, origin) {
+  const parts = id.split(':');
+  if (parts.length < 3) return [];
+  const channelId = parts[1];
+  const messageId = parts[2];
+  return [makeStream(origin, channelId, messageId, 'DarkWave', 'Telegram direct')];
+}
+
+async function streamsFromImdb(id, type, env, origin) {
+  const API_BASE = (env.TELEGRAM_API_URL || '').replace(/\/$/, '');
+  if (!API_BASE) return [];
+
+  const imdb = id.split(':')[0];
+  const season = type === 'series' && id.includes(':') ? Number(id.split(':')[1]) : null;
+  const episode = type === 'series' && id.includes(':') ? Number(id.split(':')[2]) : null;
+
+  const meta = await fetchCinemeta(type === 'series' ? 'series' : 'movie', imdb);
+  if (!meta?.name) return [];
+
+  const year = meta.year ? String(meta.year).slice(0, 4) : '';
+  const queries = buildSearchQueries(meta.name, year, season, episode);
+
+  const results = [];
+  const seen = new Set();
+  for (const q of queries) {
+    const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}`);
+    if (!res.ok) continue;
+    const data = await res.json();
+    for (const item of data.results || []) {
+      const key = `${item.channel_id}:${item.message_id}`;
+      if (seen.has(key)) continue;
+      if (!matchesMeta(item, meta.name, year, season, episode, type)) continue;
+      seen.add(key);
+      results.push(item);
+    }
+    if (results.length >= 12) break;
+  }
+
+  return results.map((item) => {
+    const info = item.info || {};
+    const label = [info.quality, info.source, info.size].filter(Boolean).join(' · ') || item.file_name || 'Telegram';
+    return makeStream(origin, item.channel_id, item.message_id, '🌊 DarkWave', label, item.file_name);
+  });
+}
+
+async function fetchCinemeta(type, imdbId) {
+  const res = await fetch(`${CINEMETA}/meta/${type}/${imdbId}.json`);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.meta || null;
+}
+
+function buildSearchQueries(name, year, season, episode) {
+  const clean = String(name).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const qs = [clean];
+  if (year) qs.push(`${clean} ${year}`);
+  if (season != null && episode != null) {
+    const s = String(season).padStart(2, '0');
+    const e = String(episode).padStart(2, '0');
+    qs.unshift(`${clean} S${s}E${e}`);
+    qs.unshift(`${clean} ${s}x${e}`);
+  }
+  return qs;
+}
+
+function matchesMeta(item, name, year, season, episode, type) {
+  const fname = (item.file_name || '').toLowerCase();
+  const info = item.info || {};
+  const title = (info.title || '').toLowerCase();
+  const tokens = String(name).toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter((t) => t.length > 2);
+  const hay = `${fname} ${title}`;
+  const hit = tokens.length === 0 || tokens.every((t) => hay.includes(t));
+  if (!hit) return false;
+
+  if (type === 'series' && season != null && episode != null) {
+    if (info.season != null && info.episode != null) {
+      return Number(info.season) === Number(season) && Number(info.episode) === Number(episode);
+    }
+    const s = String(season).padStart(2, '0');
+    const e = String(episode).padStart(2, '0');
+    return new RegExp(`s\\s*${s}\\s*e\\s*${e}|${Number(season)}\\s*x\\s*${e}`, 'i').test(fname);
+  }
+
+  if (year && info.year && String(info.year) !== String(year)) {
+    // Soft filter: keep if filename has no other year conflict
+    if (fname.includes(String(year))) return true;
+    return Math.abs(Number(info.year) - Number(year)) <= 1;
+  }
+  return true;
+}
+
+function makeStream(origin, channelId, messageId, name, title, fileName) {
+  const safeName = (fileName && /\.[a-z0-9]{2,4}$/i.test(fileName))
+    ? fileName.split(/[/\\]/).pop()
+    : 'stream.mkv';
+  return {
+    name,
+    title,
+    url: `${origin}/stream/${channelId}/${messageId}?name=${encodeURIComponent(safeName)}`,
+    behaviorHints: {
+      bingeGroup: `darkwave-${channelId}-${messageId}`,
+      filename: safeName,
+    },
+  };
+}
+
+async function mediaProxy(request, env, url, forceDownload) {
   const API_BASE = (env.TELEGRAM_API_URL || 'https://api.telegram.org').replace(/\/$/, '');
   const BOT_TOKEN = env.TELEGRAM_BOT_TOKEN;
 
@@ -61,7 +210,7 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
   const fileOrMsgId = parts.length >= 3 ? parts[2] : parts[1];
 
   const allowedChannels = env.ALLOWED_CHANNELS
-    ? env.ALLOWED_CHANNELS.split(',').map(c => c.trim())
+    ? env.ALLOWED_CHANNELS.split(',').map((c) => c.trim())
     : DEFAULT_CHANNELS;
 
   if (channelId && !allowedChannels.includes(channelId)) {
@@ -69,21 +218,14 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
   }
 
   const fileId = url.searchParams.get('file_id') || fileOrMsgId;
-  const fileName = url.searchParams.get('name') || 'video.mp4';
+  const fileName = url.searchParams.get('name') || 'video.mkv';
   const ext = fileName.split('.').pop().toLowerCase();
-  const mimeType = MIME_TYPES[ext] || 'video/mp4';
+  const mimeType = MIME_TYPES[ext] || 'video/x-matroska';
 
   if (!fileId) return new Response('Missing file_id', { status: 400 });
 
-  // Do NOT use caches.default for media:
-  // - HEAD / empty upstream bodies were being stored as GET with Content-Length: 0
-  // - Stremio always sends Range; a poisoned 0-byte object yields 416 bytes */0
-  // - Multi-GB videos are a poor fit for the Cache API anyway
-
   try {
     let downloadUrl;
-
-    // Route to Koyeb MTProto backend if configured
     if (!API_BASE.includes('api.telegram.org')) {
       downloadUrl = `${API_BASE}/stream/${channelId || allowedChannels[0]}/${fileId}`;
     } else {
@@ -96,7 +238,7 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 
     const rangeHeader = request.headers.get('Range');
     const upstreamHeaders = {};
-    if (rangeHeader) upstreamHeaders['Range'] = rangeHeader;
+    if (rangeHeader) upstreamHeaders.Range = rangeHeader;
 
     const upstream = await fetch(downloadUrl, {
       method: request.method === 'HEAD' ? 'HEAD' : 'GET',
@@ -107,8 +249,6 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
       return new Response(`Upstream error: ${upstream.status}`, { status: upstream.status });
     }
 
-    // Prefer real Telegram mime (usually video/x-matroska). Stremio used to force
-    // name=stream.mp4 which lied as video/mp4 and broke players on MKV files.
     const upstreamType = upstream.headers.get('Content-Type');
     const contentType = (upstreamType && upstreamType.startsWith('video/'))
       ? upstreamType
@@ -118,7 +258,6 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
       'Access-Control-Allow-Origin': '*',
       'Accept-Ranges': 'bytes',
       'Content-Type': contentType,
-      // Short TTL only — never immutable year-long for seekable video
       'Cache-Control': 'public, max-age=60',
       'CF-Cache-Status': 'DYNAMIC',
       'Content-Disposition': forceDownload
@@ -126,179 +265,21 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
         : `inline; filename="${encodeURIComponent(fileName)}"`,
     });
 
-    if (upstream.headers.has('Content-Length')) resHeaders.set('Content-Length', upstream.headers.get('Content-Length'));
-    if (upstream.headers.has('Content-Range')) resHeaders.set('Content-Range', upstream.headers.get('Content-Range'));
+    if (upstream.headers.has('Content-Length')) {
+      resHeaders.set('Content-Length', upstream.headers.get('Content-Length'));
+    }
+    if (upstream.headers.has('Content-Range')) {
+      resHeaders.set('Content-Range', upstream.headers.get('Content-Range'));
+    }
 
     const status = upstream.status === 206 ? 206 : (rangeHeader && upstream.ok ? 206 : upstream.status);
 
-    // HEAD must not attach a body (and must not invent one from upstream).
     if (request.method === 'HEAD') {
       return new Response(null, { status, headers: resHeaders });
     }
 
     return new Response(upstream.body, { status, headers: resHeaders });
-
   } catch (err) {
     return new Response(`Error: ${err.message}`, { status: 500 });
   }
-}
-
-function stremioManifest(origin) {
-  return new Response(JSON.stringify({
-    id: 'io.darkwave.stream',
-    version: '4.5.3',
-    name: '🌊 DarkWave Stream',
-    description: 'Private high-speed streaming from curated Telegram sources — powered by MTProto & Cloudflare Edge.',
-    logo: 'https://i.imgur.com/5ZNRcqH.png',
-    resources: ['stream', 'catalog'],
-    types: ['movie', 'series', 'other'],
-    idPrefixes: ['tg:'],
-    catalogs: [
-      { type: 'movie', id: 'darkwave-latest', name: '🎬 DarkWave Latest Movies' },
-      { type: 'series', id: 'darkwave-series', name: '📺 DarkWave Series' },
-    ],
-    behaviorHints: { configurable: false, configurationRequired: false },
-  }, null, 2), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'max-age=3600',
-    },
-  });
-}
-
-async function stremioCatalog(url, env, origin) {
-  const API_BASE = (env.TELEGRAM_API_URL || '').replace(/\/$/, '');
-  const catalogPath = url.pathname; // e.g. /catalog/movie/darkwave-latest/search=avengers.json
-
-  // Stremio sends search in path format: /catalog/{type}/{id}/search={query}.json
-  // Or as query param: /catalog/{type}/{id}.json?search=query
-  let searchParam = url.searchParams.get('search');
-  const searchMatch = catalogPath.match(/\/search=(.+)\.json$/);
-  if (searchMatch) {
-    searchParam = decodeURIComponent(searchMatch[1]);
-  }
-
-  // Detect type from URL path: /catalog/{type}/{id}...
-  const parts = catalogPath.replace('.json', '').split('/').filter(Boolean);
-  const catalogType = parts.length >= 2 ? parts[1] : 'movie'; // movie or series
-  const catalogId = parts.length >= 3 ? parts[2] : '';
-
-  let metas = [];
-
-  try {
-    if (!API_BASE) return emptyCatalog();
-
-    if (searchParam) {
-      // Search mode — proxy to backend /search endpoint
-      const searchUrl = `${API_BASE}/search?q=${encodeURIComponent(searchParam)}&enriched=true`;
-      const res = await fetch(searchUrl);
-      if (res.ok) {
-        const data = await res.json();
-        metas = buildMetasFromItems(data.results || [], catalogType);
-      }
-    } else {
-      // Browse mode — fetch recent items
-      const res = await fetch(`${API_BASE}/recent?limit=50&enriched=true`);
-      if (res.ok) {
-        const data = await res.json();
-        metas = buildMetasFromItems(data.items || [], catalogType);
-      }
-    }
-  } catch (e) {
-    console.error('Catalog error:', e);
-  }
-
-  return new Response(JSON.stringify({ metas }), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': searchParam ? 'no-cache' : 'max-age=300',
-    },
-  });
-}
-
-function buildMetasFromItems(items, catalogType) {
-  return items
-    .filter(item => {
-      const mt = item.info?.media_type || 'movie';
-      // Show all items if 'other', filter by type for movie/series catalogs
-      if (catalogType === 'other') return true;
-      return mt === catalogType;
-    })
-    .map(item => {
-      const info = item.info || {};
-      const tmdb = info.tmdb || {};
-      const quality = info.quality || 'HD';
-      const source = info.source || '';
-      const year = info.year ? String(info.year) : '';
-      const size = info.size || '';
-      const mediaType = info.media_type || 'movie';
-
-      // Build description line
-      const parts = [quality, source, size].filter(Boolean);
-      let desc = parts.join(' | ');
-      if (year) desc = `${year} · ${desc}`;
-
-      // Use TMDB poster if available
-      const poster = tmdb.poster || null;
-      const background = tmdb.backdrop || poster;
-
-      const meta = {
-        id: `tg:${item.channel_id}:${item.message_id}`,
-        type: mediaType === 'series' ? 'series' : 'movie',
-        name: tmdb.title || info.title || item.file_name || 'Unknown',
-        description: tmdb.overview || desc,
-        poster,
-        background,
-        logo: poster,
-        year,
-        releaseInfo: year,
-        imdbRating: tmdb.vote_average ? String(tmdb.vote_average) : undefined,
-        posterShape: 'poster',
-      };
-
-      if (mediaType === 'series' && info.season != null) {
-        meta.season = info.season;
-        meta.episode = info.episode;
-      }
-
-      return meta;
-    });
-}
-
-function emptyCatalog() {
-  return new Response(JSON.stringify({ metas: [] }), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'max-age=60',
-    },
-  });
-}
-
-async function stremioStream(path, url, env, origin) {
-  const id = decodeURIComponent(path.replace(/^\/stream\/[^/]+\//, '').replace(/\.json$/, ''));
-  let streams = [];
-
-  if (id.startsWith('tg:')) {
-    const parts = id.split(':');
-    if (parts.length >= 3) {
-      // Prefer real mime from backend; most sources are MKV.
-      const streamUrl = `${origin}/stream/${parts[1]}/${parts[2]}?name=stream.mkv`;
-      streams.push({
-        name: '🌊 DarkWave',
-        title: 'Edge Stream | Telegram MTProto',
-        url: streamUrl,
-        behaviorHints: {
-          bingeGroup: `darkwave-${parts[1]}-${parts[2]}`,
-          filename: 'stream.mkv',
-        },
-      });
-    }
-  }
-
-  return new Response(JSON.stringify({ streams }), {
-    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' },
-  });
 }
