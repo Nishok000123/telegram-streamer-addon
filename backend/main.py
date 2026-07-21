@@ -47,6 +47,8 @@ BACKEND_URL = os.environ.get(
     "BACKEND_URL",
     "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app",
 ).rstrip("/")
+INDEX_SECRET = os.environ.get("INDEX_SECRET", "").strip()
+INDEX_PER_CHANNEL = int(os.environ.get("INDEX_PER_CHANNEL", "250"))
 ALLOWED_CHANNELS = [
     c.strip()
     for c in os.environ.get("ALLOWED_CHANNELS", "-1003916531716,-1002502061360,-1003967652604,-1002708448330").split(",")
@@ -56,7 +58,7 @@ ALLOWED_CHANNELS = [
 BOT_USERNAME = ""
 BOT_LINK = ""
 
-app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.3.0")
+app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Pyrogram get_file is not safe under concurrent streams on one client —
@@ -69,6 +71,15 @@ PREFETCH_CHUNKS = 4  # fetch 4 consecutive Telegram chunks per lock hold
 # Cache get_messages metadata so Range probes / seeks skip repeated peer RPCs.
 MSG_CACHE = {}  # (channel_id, message_id) -> (ts, msg)
 MSG_CACHE_TTL = 600
+
+# Media library index (scan once, browse forever until rebuild).
+MEDIA_INDEX = {
+    "updated_at": 0,
+    "total": 0,
+    "items": [],
+}
+INDEX_BUILDING = False
+HOT_LIMIT = 40  # auto-suggest prewarm count per category
 
 # User session = channel search + streaming.
 # Bot commands/inline use Telegram HTTP webhooks (no Pyrogram bot_client polling).
@@ -119,7 +130,7 @@ SOURCE_PATTERNS = {
 }
 
 
-def parse_media_info(file_name: str, file_size: int) -> dict:
+def parse_media_info(file_name: str, file_size: int, channel_id: str = "") -> dict:
     n = file_name.lower()
     base = os.path.splitext(file_name)[0]
 
@@ -186,7 +197,217 @@ def parse_media_info(file_name: str, file_size: int) -> dict:
         e_title = base[series_match.end():].replace(".", " ").replace("_", " ").strip()
         info["episode_title"] = e_title if e_title else None
 
+    lang = detect_language(file_name, channel_hint=channel_id or "")
+    info["language"] = lang["language"]
+    info["languages"] = lang["languages"]
+    info["multi_audio"] = lang["multi_audio"]
     return info
+
+
+TAMIL_RE = re.compile(
+    r"(?:^|[^a-z])(?:tamil|tamizh|tam(?:il)?|தமிழ்)(?:[^a-z]|$)|tamil[\s._-]?audio|audio[\s._-]?tamil",
+    re.IGNORECASE,
+)
+HINDI_RE = re.compile(r"(?:^|[^a-z])(?:hindi|hin)(?:[^a-z]|$)|hindi[\s._-]?audio", re.IGNORECASE)
+TELUGU_RE = re.compile(r"(?:^|[^a-z])(?:telugu|tel)(?:[^a-z]|$)", re.IGNORECASE)
+MALAYALAM_RE = re.compile(r"(?:^|[^a-z])(?:malayalam|mal)(?:[^a-z]|$)", re.IGNORECASE)
+KANNADA_RE = re.compile(r"(?:^|[^a-z])(?:kannada|kan)(?:[^a-z]|$)", re.IGNORECASE)
+ENGLISH_RE = re.compile(r"(?:^|[^a-z])(?:english|eng)(?:[^a-z]|$)|eng[\s._-]?audio", re.IGNORECASE)
+MULTI_RE = re.compile(r"multi[\s._-]?audio|dual[\s._-]?audio|\bmulti\b|\bdual\b", re.IGNORECASE)
+
+# Channel ID → forced language hint (Tam Mob Hollywood often Tamil-dub / multi)
+CHANNEL_LANG_HINT = {
+    "-1002708448330": "tamil",  # Tam Mob
+}
+
+
+def detect_language(file_name: str, channel_hint: str = "") -> dict:
+    """Heuristic language tags from filename + optional channel hint."""
+    n = file_name or ""
+    langs = []
+    if TAMIL_RE.search(n):
+        langs.append("tamil")
+    if HINDI_RE.search(n):
+        langs.append("hindi")
+    if TELUGU_RE.search(n):
+        langs.append("telugu")
+    if MALAYALAM_RE.search(n):
+        langs.append("malayalam")
+    if KANNADA_RE.search(n):
+        langs.append("kannada")
+    if ENGLISH_RE.search(n):
+        langs.append("english")
+
+    multi = bool(MULTI_RE.search(n)) or len(langs) >= 2
+    ch = str(channel_hint or "")
+    hint = (CHANNEL_LANG_HINT.get(ch) or "").lower()
+
+    if not langs and hint == "tamil":
+        langs = ["tamil", "english"]
+        multi = True
+
+    if not langs:
+        # No Indian lang tags → treat as English (Hollywood dumps)
+        langs = ["english"]
+
+    # Primary: Tamil wins if present (user preference), else first tag
+    if "tamil" in langs:
+        primary = "tamil"
+    elif "english" in langs and not any(x in langs for x in ("hindi", "telugu", "malayalam", "kannada")):
+        primary = "english"
+    else:
+        primary = langs[0]
+
+    return {
+        "language": primary,
+        "languages": langs,
+        "multi_audio": multi,
+    }
+
+
+def _popularity_score(item: dict) -> float:
+    info = item.get("info") or {}
+    score = 0.0
+    q = (info.get("quality") or "").lower()
+    if "4k" in q or "2160" in q:
+        score += 40
+    elif "1080" in q:
+        score += 28
+    elif "720" in q:
+        score += 14
+    src = (info.get("source") or "").lower()
+    if "bluray" in src or "web-dl" in src or "webdl" in src:
+        score += 10
+    elif "webrip" in src:
+        score += 6
+    year = info.get("year")
+    if year:
+        # Prefer recent years
+        score += max(0, min(20, (int(year) - 2000)))
+    if info.get("multi_audio"):
+        score += 8
+    if info.get("language") == "tamil":
+        score += 5
+    # Newer telegram posts slightly higher
+    score += min(15, (item.get("message_id") or 0) % 1000) / 100.0
+    return score
+
+
+def _index_item(ch: str, msg, media) -> dict:
+    fname = getattr(media, "file_name", None) or f"file_{msg.id}.mp4"
+    info = parse_media_info(fname, media.file_size, channel_id=ch)
+    title = info.get("title") or fname
+    title = re.sub(r"[._]+", " ", str(title)).strip()
+    info["title"] = title
+    return {
+        "id": f"{ch}:{msg.id}",
+        "channel_id": ch,
+        "message_id": msg.id,
+        "file_name": fname,
+        "file_size": media.file_size,
+        "mime_type": getattr(media, "mime_type", "video/mp4"),
+        "date": int(msg.date.timestamp()) if getattr(msg, "date", None) else 0,
+        "info": info,
+        "r2_cached": False,
+        "popularity": 0.0,
+    }
+
+
+async def rebuild_media_index(per_channel: int = None) -> dict:
+    """Scan source channels and rebuild in-memory MEDIA_INDEX."""
+    global MEDIA_INDEX, INDEX_BUILDING
+    if not tg_client:
+        raise RuntimeError("Telegram client not connected")
+    if INDEX_BUILDING:
+        return {"status": "busy", "message": "Index rebuild already running"}
+    INDEX_BUILDING = True
+    limit = per_channel or INDEX_PER_CHANNEL
+    items = []
+    seen = set()
+    try:
+        for ch in ALLOWED_CHANNELS:
+            try:
+                async for msg in tg_client.get_chat_history(int(ch), limit=limit):
+                    media = msg.video or msg.document or msg.audio
+                    if not media:
+                        continue
+                    key = (ch, msg.id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    item = _index_item(ch, msg, media)
+                    item["popularity"] = _popularity_score(item)
+                    items.append(item)
+            except Exception as e:
+                print(f"Index scan error {ch}: {e}")
+        items.sort(key=lambda x: x.get("date") or 0, reverse=True)
+        MEDIA_INDEX = {
+            "updated_at": int(time.time()),
+            "total": len(items),
+            "per_channel": limit,
+            "items": items,
+        }
+        print(f"✅ Media index rebuilt: {len(items)} items")
+        return {"status": "ok", "total": len(items), "updated_at": MEDIA_INDEX["updated_at"]}
+    finally:
+        INDEX_BUILDING = False
+
+
+def _filter_index(
+    language: str = None,
+    sort: str = "latest",
+    limit: int = 40,
+    media_type: str = "movie",
+    multi_only: bool = False,
+):
+    items = list(MEDIA_INDEX.get("items") or [])
+    if media_type and media_type != "all":
+        items = [i for i in items if (i.get("info") or {}).get("media_type") == media_type]
+    if language:
+        lang = language.lower()
+        if lang == "tamil":
+            # Tamil primary OR multi/dual that includes Tamil
+            items = [
+                i for i in items
+                if (i.get("info") or {}).get("language") == "tamil"
+                or "tamil" in ((i.get("info") or {}).get("languages") or [])
+            ]
+        elif lang == "english":
+            items = [
+                i for i in items
+                if (i.get("info") or {}).get("language") == "english"
+                or (
+                    "english" in ((i.get("info") or {}).get("languages") or [])
+                    and (i.get("info") or {}).get("language") != "tamil"
+                )
+            ]
+        else:
+            items = [i for i in items if (i.get("info") or {}).get("language") == lang]
+    if multi_only:
+        items = [i for i in items if (i.get("info") or {}).get("multi_audio")]
+    if sort == "popular":
+        items.sort(key=lambda x: x.get("popularity") or 0, reverse=True)
+    else:
+        items.sort(key=lambda x: x.get("date") or 0, reverse=True)
+    return items[: max(1, min(limit, 200))]
+
+
+def build_category_bundle(limit: int = None):
+    n = limit or HOT_LIMIT
+    return {
+        "updated_at": MEDIA_INDEX.get("updated_at") or 0,
+        "total_indexed": MEDIA_INDEX.get("total") or 0,
+        "tamil_latest": _filter_index("tamil", "latest", n),
+        "tamil_popular": _filter_index("tamil", "popular", n),
+        "english_latest": _filter_index("english", "latest", n),
+        "english_popular": _filter_index("english", "popular", n),
+        "multi_audio_latest": _filter_index(None, "latest", n, multi_only=True),
+        "hot_prewarm": (
+            _filter_index("tamil", "latest", min(15, n))
+            + _filter_index("tamil", "popular", min(10, n))
+            + _filter_index("english", "popular", min(10, n))
+        ),
+    }
 
 
 # ── TMDB Metadata Cache ───────────────────────────────────────────────────────
@@ -323,6 +544,21 @@ async def _bot_search_and_reply(chat_id: int, query: str):
     status_id = (status.get("result") or {}).get("message_id")
     max_results = 8
 
+    # Prefer index hit first (no Telegram round-trip)
+    qlow = query.lower().strip()
+    indexed = [
+        i for i in (MEDIA_INDEX.get("items") or [])
+        if qlow in (i.get("file_name") or "").lower()
+        or qlow in ((i.get("info") or {}).get("title") or "").lower()
+    ][:max_results]
+
+    if indexed:
+        for item in indexed:
+            await _bot_send_index_item(chat_id, item)
+        if status_id:
+            await bot_api("deleteMessage", chat_id=chat_id, message_id=status_id)
+        return
+
     # Parallel channel search — biggest bot latency win vs sequential waits.
     channel_hits = await asyncio.gather(
         *[_search_channel(ch, query, limit=6) for ch in ALLOWED_CHANNELS]
@@ -334,32 +570,16 @@ async def _bot_search_and_reply(chat_id: int, query: str):
                 break
             found += 1
             fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-            # Skip TMDB on bot hot path — parse filename only (quality/size/year).
-            info = parse_media_info(fname, media.file_size)
-            stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
-            dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={fname}"
-
-            extras = []
-            if info.get("year"):
-                extras.append(f"📅 {info['year']}")
-            if info.get("source") and info["source"] != "Unknown":
-                extras.append(f"📀 {info['source']}")
-            extras_str = ("\n" + " | ".join(extras)) if extras else ""
-
-            await bot_api(
-                "sendMessage",
-                chat_id=chat_id,
-                text=(
-                    f"🎬 **{fname}**\n"
-                    f"📌 {info['quality']} | {info['source']} | 📦 {info['size']}"
-                    f"{extras_str}"
-                ),
-                parse_mode="Markdown",
-                reply_markup=_ikb([[
-                    {"text": "▶️ Stream", "url": stream_url},
-                    {"text": "📥 Download", "url": dl_url},
-                ]]),
-            )
+            info = parse_media_info(fname, media.file_size, channel_id=ch)
+            item = {
+                "id": f"{ch}:{m.id}",
+                "channel_id": ch,
+                "message_id": m.id,
+                "file_name": fname,
+                "file_size": media.file_size,
+                "info": info,
+            }
+            await _bot_send_index_item(chat_id, item)
         if found >= max_results:
             break
 
@@ -374,6 +594,108 @@ async def _bot_search_and_reply(chat_id: int, query: str):
                 text=f"❌ Nothing found for **{query}** in source channels.",
                 parse_mode="Markdown",
             )
+
+
+async def _bot_send_index_item(chat_id: int, item: dict):
+    info = item.get("info") or {}
+    fname = item.get("file_name") or "file"
+    ch = item.get("channel_id")
+    mid = item.get("message_id")
+    stream_url = f"{WORKER_URL}/stream/{ch}/{mid}?name={fname}"
+    langs = ", ".join(info.get("languages") or ([info.get("language")] if info.get("language") else []))
+    extras = []
+    if info.get("year"):
+        extras.append(f"📅 {info['year']}")
+    if info.get("multi_audio"):
+        extras.append("🎧 Multi")
+    if langs:
+        extras.append(f"🗣 {langs}")
+    if info.get("source") and info["source"] != "Unknown":
+        extras.append(f"📀 {info['source']}")
+    extras_str = ("\n" + " | ".join(extras)) if extras else ""
+    await bot_api(
+        "sendMessage",
+        chat_id=chat_id,
+        text=(
+            f"🎬 **{(info.get('title') or fname)[:80]}**\n"
+            f"📌 {info.get('quality', '?')} | {info.get('source', '?')} | 📦 {info.get('size', '?')}"
+            f"{extras_str}\n"
+            f"`{ch}:{mid}`"
+        ),
+        parse_mode="Markdown",
+        reply_markup=_ikb([[
+            {"text": "▶️ Stream", "url": stream_url},
+            {"text": "💾 Cache", "callback_data": f"pw:{ch}:{mid}"},
+        ]]),
+    )
+
+
+async def _push_index_to_worker():
+    """POST category bundle to Worker (KV mirror if bound)."""
+    try:
+        body = build_category_bundle()
+        body["items"] = MEDIA_INDEX.get("items") or []
+        await asyncio.to_thread(
+            requests.post,
+            f"{WORKER_URL}/admin/index",
+            json=body,
+            headers={"X-Index-Secret": INDEX_SECRET} if INDEX_SECRET else {},
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"⚠️  push index to worker failed: {e}")
+
+
+async def _request_worker_prewarm(channel_id: str, message_id: str, file_name: str = None):
+    try:
+        payload = {"channel_id": str(channel_id), "message_id": int(message_id), "max_mb": 128}
+        if file_name:
+            payload["file_name"] = file_name
+        r = await asyncio.to_thread(
+            requests.post,
+            f"{WORKER_URL}/admin/prewarm",
+            json=payload,
+            headers={"X-Index-Secret": INDEX_SECRET} if INDEX_SECRET else {},
+            timeout=180,
+        )
+        data = r.json() if "json" in (r.headers.get("content-type") or "") else {"raw": r.text}
+        if r.ok and data.get("ok"):
+            mode = data.get("mode", "head")
+            mb = round((data.get("bytes_warmed") or data.get("bytes") or 0) / (1024 * 1024), 1)
+            note = data.get("note") or ""
+            return True, f"Cached `{channel_id}:{message_id}` ({mb} MiB, {mode}). {note}"
+        return False, f"Cache failed: `{data}`"
+    except Exception as e:
+        return False, f"Cache error: `{e}`"
+
+
+async def _request_cached_list():
+    try:
+        r = await asyncio.to_thread(
+            requests.get,
+            f"{WORKER_URL}/admin/cached",
+            headers={"X-Index-Secret": INDEX_SECRET} if INDEX_SECRET else {},
+            timeout=30,
+        )
+        return r.json() if r.ok else {"ok": False, "items": []}
+    except Exception:
+        return {"ok": False, "items": []}
+
+
+async def _bot_handle_callback(callback: dict):
+    data = (callback.get("data") or "").strip()
+    cq_id = callback.get("id")
+    msg = callback.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    if cq_id:
+        await bot_api("answerCallbackQuery", callback_query_id=cq_id, text="Caching…")
+    if data.startswith("pw:") and chat_id:
+        parts = data.split(":")
+        if len(parts) >= 3:
+            ch, mid = parts[1], parts[2]
+            await bot_api("sendMessage", chat_id=chat_id, text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB)…", parse_mode="Markdown")
+            ok, detail = await _request_worker_prewarm(ch, mid)
+            await bot_api("sendMessage", chat_id=chat_id, text=("✅ " if ok else "❌ ") + detail, parse_mode="Markdown")
 
 
 async def _bot_handle_message(message: dict):
@@ -404,9 +726,16 @@ async def _bot_handle_message(message: dict):
             text=(
                 "🎬 **Telegram Movie Streamer Bot**\n\n"
                 "Commands:\n"
-                "• `/search <title>` — search all channels\n"
-                "• `/channels` — list source channels\n"
-                "• `/help` — usage guide"
+                "• `/tamil` — latest Tamil (+ multi)\n"
+                "• `/tamil popular` — popular Tamil\n"
+                "• `/english` — latest English\n"
+                "• `/english popular` — popular English\n"
+                "• `/multi` — multi/dual audio\n"
+                "• `/cache <ch:msg>` — cache movie before watch\n"
+                "• `/cached` — list cached titles\n"
+                "• `/index` — rebuild library index\n"
+                "• `/search <title>` — live search\n"
+                "• `/channels` — source channels"
             ),
             parse_mode="Markdown",
             reply_markup=_ikb([[
@@ -424,10 +753,12 @@ async def _bot_handle_message(message: dict):
             chat_id=chat_id,
             text=(
                 "📖 **How to use:**\n\n"
-                "1. `/search Avengers` — search all source channels\n"
-                "2. Type a movie title directly in this chat\n"
-                f"3. Inline: type `{uname} movie title` anywhere in Telegram\n"
-                "4. Install Stremio Addon via the /start menu"
+                "1. `/tamil` / `/english` — browse indexed lists (fast)\n"
+                "2. Tap **💾 Cache** before watch (warms first ~128 MiB)\n"
+                "3. `/cached` — see what you cached\n"
+                "4. `/search Avengers` — live channel search\n"
+                f"5. Inline: `{uname} movie title`\n"
+                "6. `/index` — refresh library index from channels"
             ),
             parse_mode="Markdown",
         )
@@ -439,6 +770,107 @@ async def _bot_handle_message(message: dict):
             "sendMessage",
             chat_id=chat_id,
             text=f"📢 **Source Channels:**\n\n{lines}",
+            parse_mode="Markdown",
+        )
+        return
+
+    if cmd == "/index":
+        await bot_api("sendMessage", chat_id=chat_id, text="📇 Rebuilding media index…")
+        try:
+            result = await rebuild_media_index()
+            await _push_index_to_worker()
+            cats = build_category_bundle()
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=(
+                    f"✅ Index ready: **{result.get('total', 0)}** files\n"
+                    f"Tamil latest: {len(cats['tamil_latest'])} · "
+                    f"English latest: {len(cats['english_latest'])} · "
+                    f"Multi: {len(cats['multi_audio_latest'])}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await bot_api("sendMessage", chat_id=chat_id, text=f"❌ Index failed: `{e}`", parse_mode="Markdown")
+        return
+
+    if cmd in ("/tamil", "/english", "/multi"):
+        sort = "popular" if (args and args[0].lower() in ("popular", "pop", "top")) else "latest"
+        if cmd == "/multi":
+            items = _filter_index(None, sort, 8, multi_only=True)
+            label = f"Multi-audio ({sort})"
+        elif cmd == "/tamil":
+            items = _filter_index("tamil", sort, 8)
+            label = f"Tamil ({sort})"
+        else:
+            items = _filter_index("english", sort, 8)
+            label = f"English ({sort})"
+        if not items:
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=f"📭 No **{label}** yet. Run `/index` first.",
+                parse_mode="Markdown",
+            )
+            return
+        await bot_api("sendMessage", chat_id=chat_id, text=f"🎬 **{label}** — top {len(items)}", parse_mode="Markdown")
+        for item in items:
+            await _bot_send_index_item(chat_id, item)
+        return
+
+    if cmd in ("/prewarm", "/cache"):
+        target = " ".join(args).strip()
+        if not target or ":" not in target:
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=(
+                    "Usage: `/cache <channel_id>:<message_id>`\n"
+                    "Or tap **💾 Cache** on a listed title.\n"
+                    "Caches first ~128 MiB so play starts fast. Rest fills while watching."
+                ),
+                parse_mode="Markdown",
+            )
+            return
+        ch, _, mid = target.partition(":")
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB, list stays in KV)…",
+            parse_mode="Markdown",
+        )
+        ok, detail = await _request_worker_prewarm(ch.strip(), mid.strip())
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=("✅ " if ok else "❌ ") + detail,
+            parse_mode="Markdown",
+        )
+        return
+
+    if cmd == "/cached":
+        data = await _request_cached_list()
+        items = data.get("items") or []
+        if not items:
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text="📭 Nothing cached yet. Use `/tamil` then tap **💾 Cache**.",
+                parse_mode="Markdown",
+            )
+            return
+        lines = []
+        for it in items[:20]:
+            mid = it.get("id") or "?"
+            name = it.get("file_name") or mid
+            mode = it.get("mode") or "?"
+            mb = round((it.get("bytes_warmed") or 0) / (1024 * 1024), 1)
+            lines.append(f"• `{mid}` — {name[:40]} ({mb} MiB, {mode})")
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"💾 **Cached ({data.get('total', len(items))}):**\n\n" + "\n".join(lines),
             parse_mode="Markdown",
         )
         return
@@ -563,6 +995,13 @@ async def _boot_telegram():
                 "setMyCommands",
                 commands=[
                     {"command": "start", "description": "Start the bot"},
+                    {"command": "tamil", "description": "Latest / popular Tamil (+ multi)"},
+                    {"command": "english", "description": "Latest / popular English"},
+                    {"command": "multi", "description": "Multi / dual audio"},
+                    {"command": "cache", "description": "Cache a movie before watching"},
+                    {"command": "cached", "description": "List cached movies"},
+                    {"command": "prewarm", "description": "Alias for /cache"},
+                    {"command": "index", "description": "Rebuild media index"},
                     {"command": "search", "description": "Search movies/series"},
                     {"command": "channels", "description": "List source channels"},
                     {"command": "help", "description": "How to use"},
@@ -574,7 +1013,7 @@ async def _boot_telegram():
                 "setWebhook",
                 url=webhook_url,
                 drop_pending_updates=True,
-                allowed_updates=["message", "inline_query"],
+                allowed_updates=["message", "inline_query", "callback_query"],
             )
             if wh.get("ok"):
                 print(f"✅ Webhook set: {webhook_url}")
@@ -584,6 +1023,14 @@ async def _boot_telegram():
             print(f"❌ Bot webhook startup error: {e}")
     else:
         print("⚠️  Bot commands disabled (set BOT_TOKEN to enable)")
+
+    # Build media index after Telegram is up (non-blocking caller already)
+    if tg_client and getattr(tg_client, "is_connected", False):
+        try:
+            await rebuild_media_index()
+            await _push_index_to_worker()
+        except Exception as e:
+            print(f"⚠️  Startup index rebuild failed: {e}")
 
 
 @app.on_event("startup")
@@ -606,6 +1053,8 @@ async def _process_telegram_update(update: dict):
             await _bot_handle_message(update["message"])
         elif "inline_query" in update:
             await _bot_handle_inline(update["inline_query"])
+        elif "callback_query" in update:
+            await _bot_handle_callback(update["callback_query"])
     except Exception as e:
         print(f"[webhook] handler error: {e}")
 
@@ -629,7 +1078,7 @@ def root():
     mode = "user_session" if SESSION_STRING else ("bot_token" if BOT_TOKEN else "none")
     return {
         "status": "online",
-        "version": "4.3.0",
+        "version": "4.4.0",
         "mode": mode,
         "bot_mode": "webhook",
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
@@ -638,6 +1087,8 @@ def root():
         "bot_username": BOT_USERNAME or None,
         "bot_link": BOT_LINK or None,
         "channels": ALLOWED_CHANNELS,
+        "index_total": MEDIA_INDEX.get("total") or 0,
+        "index_updated_at": MEDIA_INDEX.get("updated_at") or 0,
     }
 
 
@@ -645,13 +1096,14 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "4.3.0",
+        "version": "4.4.0",
         "bot_mode": "webhook",
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
         "bot": bool(BOT_TOKEN),
         "bot_connected": bool(BOT_TOKEN and BOT_USERNAME),
         "bot_username": BOT_USERNAME or None,
         "bot_link": BOT_LINK or None,
+        "index_total": MEDIA_INDEX.get("total") or 0,
     }
 
 
@@ -669,8 +1121,72 @@ def bot_info():
         "link": BOT_LINK,
         "bot_mode": "webhook",
         "webhook": f"{BACKEND_URL}/telegram/webhook",
-        "commands": ["/start", "/search <title>", "/channels", "/help"],
+        "commands": [
+            "/start", "/tamil", "/english", "/multi",
+            "/cache", "/cached", "/index", "/search <title>", "/channels", "/help",
+        ],
     }
+
+
+def _check_index_secret(request: Request):
+    if not INDEX_SECRET:
+        return
+    got = request.headers.get("X-Index-Secret") or request.query_params.get("secret") or ""
+    if got != INDEX_SECRET:
+        raise HTTPException(401, "Invalid index secret")
+
+
+@app.post("/index/rebuild")
+async def index_rebuild(request: Request, per_channel: int = None):
+    _check_index_secret(request)
+    if not tg_client:
+        raise HTTPException(500, "Telegram client not connected")
+    result = await rebuild_media_index(per_channel)
+    await _push_index_to_worker()
+    return {**result, "categories": {
+        k: len(v) if isinstance(v, list) else v
+        for k, v in build_category_bundle().items()
+        if k != "hot_prewarm"
+    }}
+
+
+@app.get("/index")
+async def index_get(
+    language: str = None,
+    sort: str = "latest",
+    limit: int = 40,
+    media_type: str = "movie",
+    multi: str = "false",
+):
+    if not MEDIA_INDEX.get("items"):
+        return {"updated_at": 0, "total": 0, "results": [], "hint": "POST /index/rebuild first"}
+    items = _filter_index(
+        language=language,
+        sort=sort,
+        limit=limit,
+        media_type=media_type,
+        multi_only=multi.lower() == "true",
+    )
+    return {
+        "updated_at": MEDIA_INDEX.get("updated_at"),
+        "total_indexed": MEDIA_INDEX.get("total"),
+        "total": len(items),
+        "results": items,
+    }
+
+
+@app.get("/index/categories")
+async def index_categories(limit: int = 40):
+    if not MEDIA_INDEX.get("items"):
+        return {"updated_at": 0, "total_indexed": 0, "hint": "POST /index/rebuild first"}
+    return build_category_bundle(limit)
+
+
+@app.get("/index/full")
+async def index_full(request: Request):
+    """Full index dump for Worker/R2 sync."""
+    _check_index_secret(request)
+    return MEDIA_INDEX
 
 
 @app.get("/search")
@@ -687,8 +1203,35 @@ async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, 
             return cached
     CACHE_MISS += 1
 
+    # Prefer indexed results when index warm
+    qlow = q.lower().strip()
+    if MEDIA_INDEX.get("items") and not channel_id:
+        indexed = []
+        seen = set()
+        for item in MEDIA_INDEX["items"]:
+            fname = (item.get("file_name") or "").lower()
+            title = ((item.get("info") or {}).get("title") or "").lower()
+            if qlow in fname or qlow in title:
+                key = (item["channel_id"], item["message_id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                indexed.append({
+                    "channel_id": item["channel_id"],
+                    "message_id": item["message_id"],
+                    "file_name": item["file_name"],
+                    "file_size": item.get("file_size"),
+                    "mime_type": item.get("mime_type", "video/mp4"),
+                    "info": item.get("info") or {},
+                })
+            if len(indexed) >= 40:
+                break
+        if indexed:
+            body = {"query": q, "total": len(indexed), "results": indexed, "source": "index"}
+            SEARCH_CACHE[cache_key] = (now, body)
+            return body
+
     # Telegram search is literal. "obsession 2026" misses "Obsession (2025)".
-    # Also strip common typo-ish extra tokens: try full query, then without year.
     queries = []
     raw = q.strip()
     queries.append(raw)
@@ -703,7 +1246,6 @@ async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, 
     do_enrich = enriched.lower() == "true" and bool(TMDB_API_KEY)
 
     for query in queries:
-        # Search all channels in parallel for this query variant.
         channel_hits = await asyncio.gather(
             *[_search_channel(ch, query, limit=20) for ch in targets]
         )
@@ -714,7 +1256,7 @@ async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, 
                     continue
                 seen.add(key)
                 fname = getattr(media, "file_name", None) or f"file_{msg.id}.mp4"
-                info = parse_media_info(fname, media.file_size)
+                info = parse_media_info(fname, media.file_size, channel_id=ch)
                 if do_enrich:
                     info = await enrich_media_info(info)
                 results.append({
@@ -727,7 +1269,7 @@ async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, 
                 })
         if results:
             break
-    body = {"query": q, "total": len(results), "results": results}
+    body = {"query": q, "total": len(results), "results": results, "source": "telegram"}
     SEARCH_CACHE[cache_key] = (now, body)
     return body
 

@@ -2,9 +2,12 @@ name = "telegram-streamer-addon"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-[vars]
-# Live Koyeb MTProto Backend Engine
-TELEGRAM_API_URL = "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app"
+# Free Workers KV (no card). Create in Dashboard then bind as MEDIA_META,
+# OR uncomment after: npx wrangler kv namespace create MEDIA_META
+# [[kv_namespaces]]
+# binding = "MEDIA_META"
+# id = "YOUR_KV_ID"
 
-# Whitelisted Source Channels (must match backend ALLOWED_CHANNELS)
+[vars]
+TELEGRAM_API_URL = "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app"
 ALLOWED_CHANNELS = "-1003916531716,-1002502061360,-1003967652604,-1002708448330"
