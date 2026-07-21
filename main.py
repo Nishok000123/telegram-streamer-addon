@@ -10,6 +10,24 @@ from pyrogram.types import (
 )
 from pyrogram.errors import FloodWait, ChannelPrivate, MessageIdInvalid
 
+
+# ── Monkey-patch Pyrogram's handle_updates to catch ValueError on unresolvable peers ──
+_original_handle_updates = Client.handle_updates
+
+
+async def _safe_handle_updates(self, updates):
+    try:
+        await _original_handle_updates(self, updates)
+    except ValueError as e:
+        if "Peer id invalid" in str(e):
+            print(f"⚠️ [update] Skipped update for unresolvable peer: {e}")
+        else:
+            raise
+
+
+Client.handle_updates = _safe_handle_updates
+
+
 API_ID_RAW = os.environ.get("API_ID", "").strip()
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
 API_HASH = os.environ.get("API_HASH", "").strip()
@@ -202,13 +220,37 @@ async def startup():
             await tg_client.start()
             mode = "USER SESSION" if SESSION_STRING else "BOT TOKEN"
             print(f"✅ Telegram connected via {mode}")
+
+            # Warm the peer cache by fetching dialogs — populates storage with peer info
+            # This helps resolve_peer() find channels by their internal peer ID
+            try:
+                async for _ in tg_client.get_dialogs(limit=200):
+                    pass
+                print("✅ Dialog cache warmed (peers learned)")
+            except Exception as e:
+                print(f"⚠️  Could not warm dialog cache: {e}")
+
             # Resolve peers so Pyrogram caches them — required before any search/get_chat_history call
+            resolved = 0
             for ch in ALLOWED_CHANNELS:
                 try:
                     chat = await tg_client.get_chat(int(ch))
                     print(f"✅ Peer resolved: {ch} → {chat.title}")
+                    resolved += 1
+                except ValueError as e:
+                    if "Peer id invalid" in str(e):
+                        print(f"⚠️  Peer {ch} rejected by Pyrogram's MIN_CHANNEL_ID threshold.")
+                        print(f"    → Upgrade pyrogram>=2.1.32 or ensure your account has joined this channel.")
+                    else:
+                        print(f"⚠️  Could not resolve peer {ch}: {e}")
                 except Exception as e:
                     print(f"⚠️  Could not resolve peer {ch}: {e}")
+
+            if resolved:
+                print(f"✅ {resolved}/{len(ALLOWED_CHANNELS)} channels resolved successfully")
+            else:
+                print(f"⚠️  No channels were resolved. Searches and streaming will likely fail.")
+
         except Exception as e:
             print(f"❌ Startup error: {e}")
 

@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-pyrogram
+pyrogram>=2.1.32
 tgcrypto
 requests
