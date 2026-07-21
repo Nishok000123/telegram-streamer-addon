@@ -10,7 +10,7 @@ const MIME_TYPES = {
   flac: 'audio/flac', m4a: 'audio/mp4', ogg: 'audio/ogg', aac: 'audio/aac',
 };
 
-const DEFAULT_CHANNELS = ['-1003967652604', '-1002502061360', '-1003916531716'];
+const DEFAULT_CHANNELS = ['-1003916531716', '-1002502061360', '-1003967652604', '-1002708448330'];
 
 export default {
   async fetch(request, env, ctx) {
@@ -136,14 +136,17 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 function stremioManifest(origin) {
   return new Response(JSON.stringify({
     id: 'io.darkwave.stream',
-    version: '4.0.0',
+    version: '4.5.0',
     name: '🌊 DarkWave Stream',
     description: 'Private high-speed streaming from curated Telegram sources — powered by MTProto & Cloudflare Edge.',
     logo: 'https://i.imgur.com/5ZNRcqH.png',
     resources: ['stream', 'catalog'],
     types: ['movie', 'series', 'other'],
     idPrefixes: ['tg:'],
-    catalogs: [{ type: 'movie', id: 'darkwave-latest', name: '🎬 DarkWave Latest' }],
+    catalogs: [
+      { type: 'movie', id: 'darkwave-latest', name: '🎬 DarkWave Latest Movies' },
+      { type: 'series', id: 'darkwave-series', name: '📺 DarkWave Series' },
+    ],
     behaviorHints: { configurable: false, configurationRequired: false },
   }, null, 2), {
     headers: {
@@ -156,23 +159,111 @@ function stremioManifest(origin) {
 
 async function stremioCatalog(url, env, origin) {
   const API_BASE = (env.TELEGRAM_API_URL || '').replace(/\/$/, '');
+  const catalogPath = url.pathname; // e.g. /catalog/movie/darkwave-latest/search=avengers.json
+
+  // Stremio sends search in path format: /catalog/{type}/{id}/search={query}.json
+  // Or as query param: /catalog/{type}/{id}.json?search=query
+  let searchParam = url.searchParams.get('search');
+  const searchMatch = catalogPath.match(/\/search=(.+)\.json$/);
+  if (searchMatch) {
+    searchParam = decodeURIComponent(searchMatch[1]);
+  }
+
+  // Detect type from URL path: /catalog/{type}/{id}...
+  const parts = catalogPath.replace('.json', '').split('/').filter(Boolean);
+  const catalogType = parts.length >= 2 ? parts[1] : 'movie'; // movie or series
+  const catalogId = parts.length >= 3 ? parts[2] : '';
+
   let metas = [];
+
   try {
-    if (API_BASE) {
-      const res = await fetch(`${API_BASE}/recent?limit=20`);
+    if (!API_BASE) return emptyCatalog();
+
+    if (searchParam) {
+      // Search mode — proxy to backend /search endpoint
+      const searchUrl = `${API_BASE}/search?q=${encodeURIComponent(searchParam)}&enriched=true`;
+      const res = await fetch(searchUrl);
       if (res.ok) {
         const data = await res.json();
-        metas = (data.items || []).map(item => ({
-          id: `tg:${item.channel_id}:${item.message_id}`,
-          type: 'movie',
-          name: item.file_name,
-          description: `${item.info.quality} | ${item.info.size} | ${item.info.audio}`,
-        }));
+        metas = buildMetasFromItems(data.results || [], catalogType);
+      }
+    } else {
+      // Browse mode — fetch recent items
+      const res = await fetch(`${API_BASE}/recent?limit=50&enriched=true`);
+      if (res.ok) {
+        const data = await res.json();
+        metas = buildMetasFromItems(data.items || [], catalogType);
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error('Catalog error:', e);
+  }
+
   return new Response(JSON.stringify({ metas }), {
-    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'max-age=300' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': searchParam ? 'no-cache' : 'max-age=300',
+    },
+  });
+}
+
+function buildMetasFromItems(items, catalogType) {
+  return items
+    .filter(item => {
+      const mt = item.info?.media_type || 'movie';
+      // Show all items if 'other', filter by type for movie/series catalogs
+      if (catalogType === 'other') return true;
+      return mt === catalogType;
+    })
+    .map(item => {
+      const info = item.info || {};
+      const tmdb = info.tmdb || {};
+      const quality = info.quality || 'HD';
+      const source = info.source || '';
+      const year = info.year ? String(info.year) : '';
+      const size = info.size || '';
+      const mediaType = info.media_type || 'movie';
+
+      // Build description line
+      const parts = [quality, source, size].filter(Boolean);
+      let desc = parts.join(' | ');
+      if (year) desc = `${year} · ${desc}`;
+
+      // Use TMDB poster if available
+      const poster = tmdb.poster || null;
+      const background = tmdb.backdrop || poster;
+
+      const meta = {
+        id: `tg:${item.channel_id}:${item.message_id}`,
+        type: mediaType === 'series' ? 'series' : 'movie',
+        name: tmdb.title || info.title || item.file_name || 'Unknown',
+        description: tmdb.overview || desc,
+        poster,
+        background,
+        logo: poster,
+        year,
+        releaseInfo: year,
+        imdbRating: tmdb.vote_average ? String(tmdb.vote_average) : undefined,
+        posterShape: 'poster',
+      };
+
+      if (mediaType === 'series' && info.season != null) {
+        meta.season = info.season;
+        meta.episode = info.episode;
+      }
+
+      return meta;
+    });
+}
+
+function emptyCatalog() {
+  return new Response(JSON.stringify({ metas: [] }), {
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'max-age=60',
+    },
   });
 }
 
