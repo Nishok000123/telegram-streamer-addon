@@ -53,7 +53,10 @@ ALLOWED_CHANNELS = [
     if c.strip()
 ]
 
-app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.1.0")
+BOT_USERNAME = ""
+BOT_LINK = ""
+
+app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.1.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Pyrogram get_file is not safe under concurrent streams on one client —
@@ -275,8 +278,9 @@ def _search_client():
 
 
 if bot_client:
-    @bot_client.on_message(filters.command("start") & filters.private)
+    @bot_client.on_message(filters.command("start"))
     async def cmd_start(client: Client, msg: Message):
+        print(f"[bot] /start from {msg.from_user.id if msg.from_user else '?'}")
         await msg.reply_text(
             "🎬 **Telegram Movie Streamer Bot**\n\n"
             "Commands:\n"
@@ -290,7 +294,7 @@ if bot_client:
             disable_web_page_preview=True,
         )
 
-    @bot_client.on_message(filters.command("help") & filters.private)
+    @bot_client.on_message(filters.command("help"))
     async def cmd_help(client: Client, msg: Message):
         me = await client.get_me()
         uname = f"@{me.username}" if me and me.username else "@your_bot"
@@ -302,12 +306,12 @@ if bot_client:
             "4. Install Stremio Addon via the /start menu"
         )
 
-    @bot_client.on_message(filters.command("channels") & filters.private)
+    @bot_client.on_message(filters.command("channels"))
     async def cmd_channels(client: Client, msg: Message):
         lines = "\n".join(f"• `{ch}`" for ch in ALLOWED_CHANNELS)
         await msg.reply_text(f"📢 **Source Channels:**\n\n{lines}")
 
-    @bot_client.on_message(filters.command("search") & filters.private)
+    @bot_client.on_message(filters.command("search"))
     async def cmd_search(client: Client, msg: Message):
         query = " ".join(msg.command[1:]).strip()
         if not query:
@@ -319,6 +323,7 @@ if bot_client:
             await msg.reply_text("❌ Search backend not connected.")
             return
 
+        print(f"[bot] /search {query!r} from {msg.from_user.id if msg.from_user else '?'}")
         status = await msg.reply_text(f"🔍 Searching for **{query}**…")
         found = 0
 
@@ -365,6 +370,15 @@ if bot_client:
         else:
             await status.edit_text(f"❌ Nothing found for **{query}** in source channels.")
 
+    @bot_client.on_message(filters.private & filters.text & ~filters.command(["start", "help", "channels", "search"]))
+    async def private_text_hint(client: Client, msg: Message):
+        # If user types a title without /search, treat it as search.
+        q = (msg.text or "").strip()
+        if len(q) < 2:
+            return
+        msg.command = ["search", *q.split()]
+        await cmd_search(client, msg)
+
     @bot_client.on_message(filters.private & (filters.media | filters.forwarded))
     async def auto_stream_link(client: Client, msg: Message):
         media = msg.video or msg.document or msg.audio
@@ -374,6 +388,9 @@ if bot_client:
         fwd_chat = str(msg.forward_from_chat.id) if msg.forward_from_chat else ""
         target = fwd_chat if fwd_chat in ALLOWED_CHANNELS else (chat_id if chat_id in ALLOWED_CHANNELS else None)
         if not target:
+            await msg.reply_text(
+                "Forward a video **from a source channel**, or use `/search <title>`."
+            )
             return
         mid = msg.forward_from_message_id or msg.id
         fname = getattr(media, "file_name", None) or "video.mp4"
@@ -479,16 +496,51 @@ async def startup():
         except Exception as e:
             print(f"❌ Startup error: {e}")
 
+    global BOT_USERNAME, BOT_LINK
     if bot_client is not None and bot_client is not tg_client:
         try:
+            # Clear Bot API webhook so MTProto updates are not blocked by an old webhook.
+            if BOT_TOKEN:
+                try:
+                    requests.get(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                        params={"drop_pending_updates": "true"},
+                        timeout=15,
+                    )
+                    print("✅ Cleared Telegram webhook (if any)")
+                except Exception as e:
+                    print(f"⚠️  deleteWebhook failed: {e}")
+
             await bot_client.start()
             me = await bot_client.get_me()
-            uname = f"@{me.username}" if me and me.username else "(no username)"
+            BOT_USERNAME = me.username if me and me.username else ""
+            BOT_LINK = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+            uname = f"@{BOT_USERNAME}" if BOT_USERNAME else "(no username — set one in @BotFather)"
             print(f"✅ Bot client connected for commands/inline: {uname}")
+            if BOT_LINK:
+                print(f"✅ Open bot: {BOT_LINK}")
+            try:
+                from pyrogram.types import BotCommand
+                await bot_client.set_bot_commands([
+                    BotCommand("start", "Start the bot"),
+                    BotCommand("search", "Search movies/series"),
+                    BotCommand("channels", "List source channels"),
+                    BotCommand("help", "How to use"),
+                ])
+            except Exception as e:
+                print(f"⚠️  set_bot_commands failed: {e}")
         except Exception as e:
             print(f"❌ Bot client startup error: {e}")
     elif bot_client is tg_client and bot_client is not None:
+        try:
+            me = await bot_client.get_me()
+            BOT_USERNAME = me.username if me and me.username else ""
+            BOT_LINK = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+        except Exception:
+            pass
         print("✅ Bot commands enabled on primary client")
+        if BOT_LINK:
+            print(f"✅ Open bot: {BOT_LINK}")
     else:
         print("⚠️  Bot commands disabled (set BOT_TOKEN to enable)")
 
@@ -506,11 +558,13 @@ def root():
     mode = "user_session" if SESSION_STRING else ("bot_token" if BOT_TOKEN else "none")
     return {
         "status": "online",
-        "version": "4.1.0",
+        "version": "4.1.1",
         "mode": mode,
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
         "bot": bool(bot_client),
         "bot_connected": getattr(bot_client, "is_connected", False) if bot_client else False,
+        "bot_username": BOT_USERNAME or None,
+        "bot_link": BOT_LINK or None,
         "channels": ALLOWED_CHANNELS,
     }
 
@@ -522,6 +576,24 @@ def health():
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
         "bot": bool(bot_client),
         "bot_connected": getattr(bot_client, "is_connected", False) if bot_client else False,
+        "bot_username": BOT_USERNAME or None,
+        "bot_link": BOT_LINK or None,
+    }
+
+
+@app.get("/bot")
+def bot_info():
+    """Public helper: open this URL to get the Telegram bot deep link."""
+    if not bot_client:
+        raise HTTPException(503, "BOT_TOKEN not configured on server.")
+    if not getattr(bot_client, "is_connected", False):
+        raise HTTPException(503, "Bot client not connected.")
+    if not BOT_LINK:
+        raise HTTPException(503, "Bot has no username. Set one in @BotFather.")
+    return {
+        "username": BOT_USERNAME,
+        "link": BOT_LINK,
+        "commands": ["/start", "/search <title>", "/channels", "/help"],
     }
 
 
