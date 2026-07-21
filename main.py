@@ -7,9 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from hydrogram import Client
 from hydrogram.errors import FloodWait, RPCError
 
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# Environment credentials
+API_ID_RAW = os.environ.get("API_ID", "").strip()
+API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
+API_HASH = os.environ.get("API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
 ALLOWED_CHANNELS = [c.strip() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
 
 app = FastAPI(title="Telegram Streamer MTProto Engine", version="2.5.0")
@@ -22,26 +25,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-tg_client = Client(
-    "tg_streamer_engine",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
-)
+tg_client = None
+if API_ID > 0 and API_HASH and BOT_TOKEN:
+    tg_client = Client(
+        "tg_streamer_engine",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        in_memory=True
+    )
+else:
+    print("⚠️ WARNING: API_ID, API_HASH, or BOT_TOKEN missing from environment variables!")
+    print("👉 Please set API_ID, API_HASH, and BOT_TOKEN in Koyeb Environment Variables.")
 
 @app.on_event("startup")
 async def startup():
     print("🚀 Starting Telegram MTProto Engine...")
-    try:
-        await tg_client.start()
-        print("✅ Telegram Client Connected Successfully!")
-    except Exception as e:
-        print(f"⚠️ Telegram Client Startup Error: {e}")
+    if tg_client:
+        try:
+            await tg_client.start()
+            print("✅ Telegram Client Connected Successfully!")
+        except Exception as e:
+            print(f"⚠️ Telegram Client Startup Error: {e}")
+    else:
+        print("⚠️ Telegram Client not initialized due to missing credentials.")
 
 @app.on_event("shutdown")
 async def shutdown():
-    if tg_client.is_connected:
+    if tg_client and getattr(tg_client, "is_connected", False):
         await tg_client.stop()
 
 @app.get("/")
@@ -50,16 +61,19 @@ def health_check():
         "status": "online",
         "engine": "Hydrogram MTProto Direct Streamer",
         "version": "2.5.0",
+        "credentials_configured": tg_client is not None,
         "channels": ALLOWED_CHANNELS,
         "features": ["Auto-Search", "Zero-Touch Auto Healing", "4K HDR Detection", "Byte-Range Caching"]
     }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "connected": tg_client.is_connected if hasattr(tg_client, 'is_connected') else True}
+    return {
+        "status": "ok",
+        "connected": tg_client.is_connected if (tg_client and hasattr(tg_client, 'is_connected')) else False
+    }
 
 def parse_media_info(file_name: str, file_size: int):
-    """Detect quality tags from file name"""
     name_lower = file_name.lower()
     quality = "720p"
     if "2160p" in name_lower or "4k" in name_lower:
@@ -87,7 +101,9 @@ def parse_media_info(file_name: str, file_size: int):
 
 @app.get("/search")
 async def search_channels(q: str = Query(..., min_length=2), channel_id: str = None):
-    """Auto Search Movies & Media Across Allowed Source Channels"""
+    if not tg_client:
+        raise HTTPException(status_code=500, detail="Telegram credentials missing. Configure API_ID, API_HASH, BOT_TOKEN in Koyeb.")
+
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
 
@@ -114,7 +130,9 @@ async def search_channels(q: str = Query(..., min_length=2), channel_id: str = N
 
 @app.get("/recent")
 async def get_recent_media(channel_id: str = None, limit: int = 20):
-    """Auto pull recent uploaded movies from channels"""
+    if not tg_client:
+        return {"total": 0, "items": [], "warning": "Credentials missing"}
+
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
 
@@ -141,7 +159,9 @@ async def get_recent_media(channel_id: str = None, limit: int = 20):
 
 @app.get("/stream/{channel_id}/{message_id}")
 async def stream_media(channel_id: str, message_id: int, request: Request):
-    """High Speed Partial Byte Range Video Streaming Engine"""
+    if not tg_client:
+        raise HTTPException(status_code=500, detail="Telegram credentials missing. Configure API_ID, API_HASH, BOT_TOKEN.")
+
     retry_count = 0
     max_retries = 3
 
