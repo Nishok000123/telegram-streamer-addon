@@ -202,6 +202,13 @@ async def startup():
             await tg_client.start()
             mode = "USER SESSION" if SESSION_STRING else "BOT TOKEN"
             print(f"✅ Telegram connected via {mode}")
+            # Resolve peers so Pyrogram caches them — required before any search/get_chat_history call
+            for ch in ALLOWED_CHANNELS:
+                try:
+                    chat = await tg_client.get_chat(int(ch))
+                    print(f"✅ Peer resolved: {ch} → {chat.title}")
+                except Exception as e:
+                    print(f"⚠️  Could not resolve peer {ch}: {e}")
         except Exception as e:
             print(f"❌ Startup error: {e}")
 
@@ -275,7 +282,7 @@ async def recent_api(channel_id: str = None, limit: int = 20):
             print(f"Recent error {ch}: {e}")
     return {"total": len(results), "items": results}
 
-@app.get("/stream/{channel_id}/{message_id}")
+@app.api_route("/stream/{channel_id}/{message_id}", methods=["GET", "HEAD"])
 async def stream_api(channel_id: str, message_id: int, request: Request):
     if not tg_client:
         raise HTTPException(500, "No Telegram client configured.")
