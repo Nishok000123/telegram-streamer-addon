@@ -6,11 +6,7 @@ import requests
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pyrogram import Client, filters
-from pyrogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, Message,
-    InlineQuery, InlineQueryResultArticle, InputTextMessageContent
-)
+from pyrogram import Client
 from pyrogram.errors import FloodWait, ChannelPrivate, MessageIdInvalid
 
 
@@ -47,6 +43,10 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
 WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.nishokroshan076632.workers.dev").rstrip("/")
+BACKEND_URL = os.environ.get(
+    "BACKEND_URL",
+    "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app",
+).rstrip("/")
 ALLOWED_CHANNELS = [
     c.strip()
     for c in os.environ.get("ALLOWED_CHANNELS", "-1003916531716,-1002502061360,-1003967652604,-1002708448330").split(",")
@@ -56,7 +56,7 @@ ALLOWED_CHANNELS = [
 BOT_USERNAME = ""
 BOT_LINK = ""
 
-app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.1.1")
+app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Pyrogram get_file is not safe under concurrent streams on one client —
@@ -64,10 +64,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 DOWNLOAD_SEM = asyncio.Semaphore(1)
 CHUNK_SIZE = 1024 * 1024
 
-# User session = channel search + streaming. Bot token = /commands + inline.
-# SESSION_STRING alone cannot receive bot DMs or inline queries.
+# User session = channel search + streaming.
+# Bot commands/inline use Telegram HTTP webhooks (no Pyrogram bot_client polling).
 tg_client = None
-bot_client = None
+bot_client = None  # unused — webhook mode only
 
 if SESSION_STRING and API_ID and API_HASH:
     print("✅ Using USER SESSION (full channel access, no admin required)")
@@ -90,21 +90,10 @@ elif BOT_TOKEN and API_ID and API_HASH:
 else:
     print("❌ No valid credentials found. Set SESSION_STRING (preferred) or BOT_TOKEN.")
 
-if BOT_TOKEN and API_ID and API_HASH and SESSION_STRING:
-    # Separate bot client so /start, /search, inline work while user session streams.
-    bot_client = Client(
-        "tg_bot_commands",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True,
-    )
-    print("✅ BOT TOKEN also configured (commands + inline enabled)")
-elif SESSION_STRING and not BOT_TOKEN:
+if BOT_TOKEN:
+    print("✅ BOT_TOKEN set — bot commands via HTTP webhook")
+elif SESSION_STRING:
     print("⚠️  BOT_TOKEN missing — Telegram bot commands/inline disabled (Stremio/API still work)")
-elif BOT_TOKEN and not SESSION_STRING:
-    bot_client = tg_client  # same client handles both
-    print("✅ Bot client = primary client (no separate user session)")
 
 # ── Content Parsing ────────────────────────────────────────────────────────────
 
@@ -270,187 +259,236 @@ async def enrich_media_info(info: dict):
 
 
 
-# ── BOT COMMAND HANDLERS (require bot_client) ─────────────────────────────────
+# ── BOT API (HTTP webhooks — wakes Koyeb on each message) ─────────────────────
 
-def _search_client():
-    """Channel search must use user session when available."""
-    return tg_client
+def bot_api(method: str, **payload):
+    if not BOT_TOKEN:
+        return {"ok": False}
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+        json=payload,
+        timeout=60,
+    )
+    return r.json()
 
 
-if bot_client:
-    @bot_client.on_message(filters.command("start"))
-    async def cmd_start(client: Client, msg: Message):
-        print(f"[bot] /start from {msg.from_user.id if msg.from_user else '?'}")
-        await msg.reply_text(
-            "🎬 **Telegram Movie Streamer Bot**\n\n"
-            "Commands:\n"
-            "• `/search <title>` — search all channels\n"
-            "• `/channels` — list source channels\n"
-            "• `/help` — usage guide",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🌐 Stremio Addon", url=f"{WORKER_URL}/manifest.json"),
-                InlineKeyboardButton("🔍 Search", switch_inline_query_current_chat=""),
-            ]]),
-            disable_web_page_preview=True,
-        )
+def _ikb(rows):
+    """Build Bot API inline_keyboard reply_markup from [[btn, ...], ...]."""
+    return {"inline_keyboard": rows}
 
-    @bot_client.on_message(filters.command("help"))
-    async def cmd_help(client: Client, msg: Message):
-        me = await client.get_me()
-        uname = f"@{me.username}" if me and me.username else "@your_bot"
-        await msg.reply_text(
-            "📖 **How to use:**\n\n"
-            "1. `/search Avengers` — search all source channels\n"
-            "2. Forward any video from a source channel here to get a stream link\n"
-            f"3. Inline: type `{uname} movie title` anywhere in Telegram\n"
-            "4. Install Stremio Addon via the /start menu"
-        )
 
-    @bot_client.on_message(filters.command("channels"))
-    async def cmd_channels(client: Client, msg: Message):
-        lines = "\n".join(f"• `{ch}`" for ch in ALLOWED_CHANNELS)
-        await msg.reply_text(f"📢 **Source Channels:**\n\n{lines}")
+async def _bot_search_and_reply(chat_id: int, query: str):
+    if not tg_client:
+        bot_api("sendMessage", chat_id=chat_id, text="❌ Search backend not connected.", parse_mode="Markdown")
+        return
 
-    @bot_client.on_message(filters.command("search"))
-    async def cmd_search(client: Client, msg: Message):
-        query = " ".join(msg.command[1:]).strip()
-        if not query:
-            await msg.reply_text("Usage: `/search <movie title>`")
-            return
+    print(f"[bot] /search {query!r} chat={chat_id}")
+    status = bot_api(
+        "sendMessage",
+        chat_id=chat_id,
+        text=f"🔍 Searching for **{query}**…",
+        parse_mode="Markdown",
+    )
+    status_id = (status.get("result") or {}).get("message_id")
+    found = 0
+    max_results = 8
 
-        searcher = _search_client()
-        if not searcher:
-            await msg.reply_text("❌ Search backend not connected.")
-            return
+    for ch in ALLOWED_CHANNELS:
+        if found >= max_results:
+            break
+        try:
+            async for m in tg_client.search_messages(int(ch), query=query, limit=10):
+                if found >= max_results:
+                    break
+                media = m.video or m.document or m.audio
+                if not media:
+                    continue
+                found += 1
+                fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
+                info = await enrich_media_info(parse_media_info(fname, media.file_size))
+                stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
+                dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={fname}"
 
-        print(f"[bot] /search {query!r} from {msg.from_user.id if msg.from_user else '?'}")
-        status = await msg.reply_text(f"🔍 Searching for **{query}**…")
-        found = 0
+                extras = []
+                if info.get("year"):
+                    extras.append(f"📅 {info['year']}")
+                if info.get("source") and info["source"] != "Unknown":
+                    extras.append(f"📀 {info['source']}")
+                extras_str = ("\n" + " | ".join(extras)) if extras else ""
 
-        for ch in ALLOWED_CHANNELS:
-            try:
-                chat_id = int(ch)
-                async for m in searcher.search_messages(chat_id, query=query, limit=10):
-                    media = m.video or m.document or m.audio
-                    if not media:
-                        continue
-                    found += 1
-                    fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-                    info = await enrich_media_info(parse_media_info(fname, media.file_size))
-                    stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
-                    dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={fname}"
+                tmdb_block = ""
+                tmdb = info.get("tmdb")
+                if tmdb and tmdb.get("vote_average"):
+                    tmdb_block = f"\n⭐ {tmdb['vote_average']}/10"
 
-                    extras = []
-                    if info.get("year"):
-                        extras.append(f"📅 {info['year']}")
-                    if info.get("source") and info["source"] != "Unknown":
-                        extras.append(f"📀 {info['source']}")
-                    extras_str = ("\n" + " | ".join(extras)) if extras else ""
-
-                    tmdb_block = ""
-                    tmdb = info.get("tmdb")
-                    if tmdb and tmdb.get("vote_average"):
-                        tmdb_block = f"\n⭐ {tmdb['vote_average']}/10"
-
-                    await msg.reply_text(
+                bot_api(
+                    "sendMessage",
+                    chat_id=chat_id,
+                    text=(
                         f"🎬 **{fname}**\n"
                         f"📌 {info['quality']} | {info['source']} | 📦 {info['size']}"
                         f"{extras_str}"
-                        f"{tmdb_block}",
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("▶️ Stream", url=stream_url),
-                            InlineKeyboardButton("📥 Download", url=dl_url),
-                        ]]),
-                    )
-            except Exception as e:
-                print(f"Search error {ch}: {e}")
+                        f"{tmdb_block}"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=_ikb([[
+                        {"text": "▶️ Stream", "url": stream_url},
+                        {"text": "📥 Download", "url": dl_url},
+                    ]]),
+                )
+        except Exception as e:
+            print(f"Search error {ch}: {e}")
 
+    if status_id:
         if found:
-            await status.delete()
+            bot_api("deleteMessage", chat_id=chat_id, message_id=status_id)
         else:
-            await status.edit_text(f"❌ Nothing found for **{query}** in source channels.")
-
-    @bot_client.on_message(filters.private & filters.text & ~filters.command(["start", "help", "channels", "search"]))
-    async def private_text_hint(client: Client, msg: Message):
-        # If user types a title without /search, treat it as search.
-        q = (msg.text or "").strip()
-        if len(q) < 2:
-            return
-        msg.command = ["search", *q.split()]
-        await cmd_search(client, msg)
-
-    @bot_client.on_message(filters.private & (filters.media | filters.forwarded))
-    async def auto_stream_link(client: Client, msg: Message):
-        media = msg.video or msg.document or msg.audio
-        if not media:
-            return
-        chat_id = str(msg.chat.id)
-        fwd_chat = str(msg.forward_from_chat.id) if msg.forward_from_chat else ""
-        target = fwd_chat if fwd_chat in ALLOWED_CHANNELS else (chat_id if chat_id in ALLOWED_CHANNELS else None)
-        if not target:
-            await msg.reply_text(
-                "Forward a video **from a source channel**, or use `/search <title>`."
+            bot_api(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=status_id,
+                text=f"❌ Nothing found for **{query}** in source channels.",
+                parse_mode="Markdown",
             )
-            return
-        mid = msg.forward_from_message_id or msg.id
-        fname = getattr(media, "file_name", None) or "video.mp4"
-        info = await enrich_media_info(parse_media_info(fname, media.file_size))
-        stream_url = f"{WORKER_URL}/stream/{target}/{mid}?name={fname}"
-        dl_url = f"{WORKER_URL}/dl/{target}/{mid}?name={fname}"
-        extras = []
-        if info.get("year"):
-            extras.append(f"📅 {info['year']}")
-        if info.get("source") and info["source"] != "Unknown":
-            extras.append(info["source"])
-        extras_str = f" | {' | '.join(extras)}" if extras else ""
-        await msg.reply_text(
-            f"⚡ **Stream link ready!**\n"
-            f"🎬 `{fname}`\n"
-            f"📦 {info['size']} | 📌 {info['quality']}{extras_str}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("▶️ Stream", url=stream_url),
-                InlineKeyboardButton("📥 Download", url=dl_url),
+
+
+async def _bot_handle_message(message: dict):
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+
+    text = (message.get("text") or "").strip()
+    if not text:
+        # Forwarded/media hint (no pyrogram peer helpers in webhook path)
+        if message.get("video") or message.get("document") or message.get("audio") or message.get("forward_from_chat"):
+            bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text="Forward a video **from a source channel**, or use `/search <title>`.",
+                parse_mode="Markdown",
+            )
+        return
+
+    cmd = text.split()[0].split("@")[0].lower()
+    args = text.split()[1:]
+
+    if cmd == "/start":
+        print(f"[bot] /start from {(message.get('from') or {}).get('id', '?')}")
+        bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=(
+                "🎬 **Telegram Movie Streamer Bot**\n\n"
+                "Commands:\n"
+                "• `/search <title>` — search all channels\n"
+                "• `/channels` — list source channels\n"
+                "• `/help` — usage guide"
+            ),
+            parse_mode="Markdown",
+            reply_markup=_ikb([[
+                {"text": "🌐 Stremio Addon", "url": f"{WORKER_URL}/manifest.json"},
+                {"text": "🔍 Search", "switch_inline_query_current_chat": ""},
             ]]),
+            disable_web_page_preview=True,
         )
+        return
 
-    @bot_client.on_inline_query()
-    async def inline_search(client: Client, iq: InlineQuery):
-        q = iq.query.strip()
-        if len(q) < 2:
-            await iq.answer([], cache_time=5, switch_pm_text="Type a movie title…", switch_pm_parameter="help")
+    if cmd == "/help":
+        uname = f"@{BOT_USERNAME}" if BOT_USERNAME else "@your_bot"
+        bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=(
+                "📖 **How to use:**\n\n"
+                "1. `/search Avengers` — search all source channels\n"
+                "2. Type a movie title directly in this chat\n"
+                f"3. Inline: type `{uname} movie title` anywhere in Telegram\n"
+                "4. Install Stremio Addon via the /start menu"
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    if cmd == "/channels":
+        lines = "\n".join(f"• `{ch}`" for ch in ALLOWED_CHANNELS)
+        bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=f"📢 **Source Channels:**\n\n{lines}",
+            parse_mode="Markdown",
+        )
+        return
+
+    if cmd == "/search":
+        query = " ".join(args).strip()
+        if not query:
+            bot_api("sendMessage", chat_id=chat_id, text="Usage: `/search <movie title>`", parse_mode="Markdown")
             return
-        searcher = _search_client()
-        if not searcher:
-            await iq.answer([], cache_time=5)
-            return
-        results = []
-        for ch in ALLOWED_CHANNELS:
-            try:
-                async for m in searcher.search_messages(int(ch), query=q, limit=5):
-                    media = m.video or m.document or m.audio
-                    if not media:
-                        continue
-                    fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-                    info = await enrich_media_info(parse_media_info(fname, media.file_size))
-                    url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
-                    desc_parts = [p for p in [info['quality'], info.get('source'), info['size']] if p and p != 'Unknown']
-                    desc = " | ".join(desc_parts)
-                    if info.get("year"):
-                        desc = f"{info['year']} · {desc}"
-                    results.append(InlineQueryResultArticle(
-                        title=(info.get('title') or fname)[:64],
-                        description=desc[:120],
-                        input_message_content=InputTextMessageContent(
-                            f"🎬 **{fname}**\n📌 {info['quality']} | {info.get('source','?')} | 📦 {info['size']}\n🔗 {url}"
+        await _bot_search_and_reply(chat_id, query)
+        return
+
+    # Private free-text → search
+    if chat.get("type") == "private" and len(text) >= 2 and not text.startswith("/"):
+        await _bot_search_and_reply(chat_id, text)
+
+
+async def _bot_handle_inline(inline_query: dict):
+    iq_id = inline_query.get("id")
+    q = (inline_query.get("query") or "").strip()
+    if not iq_id:
+        return
+    if len(q) < 2:
+        bot_api(
+            "answerInlineQuery",
+            inline_query_id=iq_id,
+            results=[],
+            cache_time=5,
+            switch_pm_text="Type a movie title…",
+            switch_pm_parameter="help",
+        )
+        return
+    if not tg_client:
+        bot_api("answerInlineQuery", inline_query_id=iq_id, results=[], cache_time=5)
+        return
+
+    results = []
+    for ch in ALLOWED_CHANNELS:
+        if len(results) >= 8:
+            break
+        try:
+            async for m in tg_client.search_messages(int(ch), query=q, limit=5):
+                if len(results) >= 8:
+                    break
+                media = m.video or m.document or m.audio
+                if not media:
+                    continue
+                fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
+                info = await enrich_media_info(parse_media_info(fname, media.file_size))
+                url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
+                desc_parts = [p for p in [info["quality"], info.get("source"), info["size"]] if p and p != "Unknown"]
+                desc = " | ".join(desc_parts)
+                if info.get("year"):
+                    desc = f"{info['year']} · {desc}"
+                results.append({
+                    "type": "article",
+                    "id": f"{ch}_{m.id}",
+                    "title": (info.get("title") or fname)[:64],
+                    "description": desc[:120],
+                    "input_message_content": {
+                        "message_text": (
+                            f"🎬 **{fname}**\n"
+                            f"📌 {info['quality']} | {info.get('source', '?')} | 📦 {info['size']}\n"
+                            f"🔗 {url}"
                         ),
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("▶️ Stream Now", url=url)
-                        ]]),
-                    ))
-            except Exception as e:
-                print(f"Inline error {ch}: {e}")
-        await iq.answer(results[:15], cache_time=60)
+                        "parse_mode": "Markdown",
+                    },
+                    "reply_markup": _ikb([[{"text": "▶️ Stream Now", "url": url}]]),
+                })
+        except Exception as e:
+            print(f"Inline error {ch}: {e}")
 
+    bot_api("answerInlineQuery", inline_query_id=iq_id, results=results, cache_time=60)
 
 
 # ── FASTAPI ENDPOINTS ─────────────────────────────────────────────────────────
@@ -497,60 +535,68 @@ async def startup():
             print(f"❌ Startup error: {e}")
 
     global BOT_USERNAME, BOT_LINK
-    if bot_client is not None and bot_client is not tg_client:
+    if BOT_TOKEN:
         try:
-            # Clear Bot API webhook so MTProto updates are not blocked by an old webhook.
-            if BOT_TOKEN:
-                try:
-                    requests.get(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-                        params={"drop_pending_updates": "true"},
-                        timeout=15,
-                    )
-                    print("✅ Cleared Telegram webhook (if any)")
-                except Exception as e:
-                    print(f"⚠️  deleteWebhook failed: {e}")
+            me = bot_api("getMe")
+            if me.get("ok"):
+                BOT_USERNAME = (me["result"].get("username") or "")
+                BOT_LINK = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+                uname = f"@{BOT_USERNAME}" if BOT_USERNAME else "(no username — set one in @BotFather)"
+                print(f"✅ Bot API getMe: {uname}")
+                if BOT_LINK:
+                    print(f"✅ Open bot: {BOT_LINK}")
+            else:
+                print(f"⚠️  getMe failed: {me}")
 
-            await bot_client.start()
-            me = await bot_client.get_me()
-            BOT_USERNAME = me.username if me and me.username else ""
-            BOT_LINK = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
-            uname = f"@{BOT_USERNAME}" if BOT_USERNAME else "(no username — set one in @BotFather)"
-            print(f"✅ Bot client connected for commands/inline: {uname}")
-            if BOT_LINK:
-                print(f"✅ Open bot: {BOT_LINK}")
-            try:
-                from pyrogram.types import BotCommand
-                await bot_client.set_bot_commands([
-                    BotCommand("start", "Start the bot"),
-                    BotCommand("search", "Search movies/series"),
-                    BotCommand("channels", "List source channels"),
-                    BotCommand("help", "How to use"),
-                ])
-            except Exception as e:
-                print(f"⚠️  set_bot_commands failed: {e}")
+            bot_api(
+                "setMyCommands",
+                commands=[
+                    {"command": "start", "description": "Start the bot"},
+                    {"command": "search", "description": "Search movies/series"},
+                    {"command": "channels", "description": "List source channels"},
+                    {"command": "help", "description": "How to use"},
+                ],
+            )
+
+            webhook_url = f"{BACKEND_URL}/telegram/webhook"
+            wh = bot_api(
+                "setWebhook",
+                url=webhook_url,
+                drop_pending_updates=True,
+                allowed_updates=["message", "inline_query"],
+            )
+            if wh.get("ok"):
+                print(f"✅ Webhook set: {webhook_url}")
+            else:
+                print(f"❌ setWebhook failed: {wh}")
         except Exception as e:
-            print(f"❌ Bot client startup error: {e}")
-    elif bot_client is tg_client and bot_client is not None:
-        try:
-            me = await bot_client.get_me()
-            BOT_USERNAME = me.username if me and me.username else ""
-            BOT_LINK = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
-        except Exception:
-            pass
-        print("✅ Bot commands enabled on primary client")
-        if BOT_LINK:
-            print(f"✅ Open bot: {BOT_LINK}")
+            print(f"❌ Bot webhook startup error: {e}")
     else:
         print("⚠️  Bot commands disabled (set BOT_TOKEN to enable)")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    if bot_client is not None and bot_client is not tg_client and getattr(bot_client, "is_connected", False):
-        await bot_client.stop()
     if tg_client and getattr(tg_client, "is_connected", False):
         await tg_client.stop()
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    try:
+        if "message" in update:
+            await _bot_handle_message(update["message"])
+        elif "inline_query" in update:
+            await _bot_handle_inline(update["inline_query"])
+    except Exception as e:
+        print(f"[webhook] handler error: {e}")
+
+    return {"ok": True}
 
 
 @app.get("/")
@@ -558,11 +604,12 @@ def root():
     mode = "user_session" if SESSION_STRING else ("bot_token" if BOT_TOKEN else "none")
     return {
         "status": "online",
-        "version": "4.1.1",
+        "version": "4.2.0",
         "mode": mode,
+        "bot_mode": "webhook",
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
-        "bot": bool(bot_client),
-        "bot_connected": getattr(bot_client, "is_connected", False) if bot_client else False,
+        "bot": bool(BOT_TOKEN),
+        "bot_connected": bool(BOT_TOKEN and BOT_USERNAME),
         "bot_username": BOT_USERNAME or None,
         "bot_link": BOT_LINK or None,
         "channels": ALLOWED_CHANNELS,
@@ -573,9 +620,11 @@ def root():
 def health():
     return {
         "status": "ok",
+        "version": "4.2.0",
+        "bot_mode": "webhook",
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
-        "bot": bool(bot_client),
-        "bot_connected": getattr(bot_client, "is_connected", False) if bot_client else False,
+        "bot": bool(BOT_TOKEN),
+        "bot_connected": bool(BOT_TOKEN and BOT_USERNAME),
         "bot_username": BOT_USERNAME or None,
         "bot_link": BOT_LINK or None,
     }
@@ -584,15 +633,17 @@ def health():
 @app.get("/bot")
 def bot_info():
     """Public helper: open this URL to get the Telegram bot deep link."""
-    if not bot_client:
+    if not BOT_TOKEN:
         raise HTTPException(503, "BOT_TOKEN not configured on server.")
-    if not getattr(bot_client, "is_connected", False):
-        raise HTTPException(503, "Bot client not connected.")
+    if not BOT_USERNAME:
+        raise HTTPException(503, "Bot not ready (getMe failed or no username).")
     if not BOT_LINK:
         raise HTTPException(503, "Bot has no username. Set one in @BotFather.")
     return {
         "username": BOT_USERNAME,
         "link": BOT_LINK,
+        "bot_mode": "webhook",
+        "webhook": f"{BACKEND_URL}/telegram/webhook",
         "commands": ["/start", "/search <title>", "/channels", "/help"],
     }
 
