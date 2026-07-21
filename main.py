@@ -4,18 +4,19 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from hydrogram import Client
+from hydrogram import Client, filters
+from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, InlineQuery, InlineQueryResultArticle, InputTextMessageContent
 from hydrogram.errors import FloodWait, RPCError
 
-# Environment credentials
 API_ID_RAW = os.environ.get("API_ID", "").strip()
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.pages.dev").rstrip('/')
 
 ALLOWED_CHANNELS = [c.strip() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
 
-app = FastAPI(title="Telegram Streamer MTProto Engine", version="2.5.0")
+app = FastAPI(title="Telegram Streamer MTProto Engine & Bot Interface", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,43 +36,7 @@ if API_ID > 0 and API_HASH and BOT_TOKEN:
         in_memory=True
     )
 else:
-    print("⚠️ WARNING: API_ID, API_HASH, or BOT_TOKEN missing from environment variables!")
-    print("👉 Please set API_ID, API_HASH, and BOT_TOKEN in Koyeb Environment Variables.")
-
-@app.on_event("startup")
-async def startup():
-    print("🚀 Starting Telegram MTProto Engine...")
-    if tg_client:
-        try:
-            await tg_client.start()
-            print("✅ Telegram Client Connected Successfully!")
-        except Exception as e:
-            print(f"⚠️ Telegram Client Startup Error: {e}")
-    else:
-        print("⚠️ Telegram Client not initialized due to missing credentials.")
-
-@app.on_event("shutdown")
-async def shutdown():
-    if tg_client and getattr(tg_client, "is_connected", False):
-        await tg_client.stop()
-
-@app.get("/")
-def health_check():
-    return {
-        "status": "online",
-        "engine": "Hydrogram MTProto Direct Streamer",
-        "version": "2.5.0",
-        "credentials_configured": tg_client is not None,
-        "channels": ALLOWED_CHANNELS,
-        "features": ["Auto-Search", "Zero-Touch Auto Healing", "4K HDR Detection", "Byte-Range Caching"]
-    }
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "connected": tg_client.is_connected if (tg_client and hasattr(tg_client, 'is_connected')) else False
-    }
+    print("⚠️ WARNING: API_ID, API_HASH, or BOT_TOKEN missing!")
 
 def parse_media_info(file_name: str, file_size: int):
     name_lower = file_name.lower()
@@ -99,10 +64,203 @@ def parse_media_info(file_name: str, file_size: int):
         "file_name": file_name
     }
 
+# ================= TELEGRAM BOT COMMAND HANDLERS =================
+
+if tg_client:
+    @tg_client.on_message(filters.command("start"))
+    async def start_command(client: Client, message: Message):
+        welcome_text = (
+            "✨ **Welcome to Telegram Movie Streamer & Stremio Bot** ✨\n\n"
+            "I can generate high-speed direct streamable links, Stremio addon streams, and instant download URLs for movies stored in source channels!\n\n"
+            "🔍 **Commands:**\n"
+            "• `/search <movie name>` — Search across channels\n"
+            "• `/channels` — List source channels\n"
+            "• `/help` — How to use this bot\n\n"
+            "💡 *Tip: Forward any video from your source channels to get instant stream links!*"
+        )
+        buttons = InlineKeyboardMarkup([
+          [
+            InlineKeyboardButton("🎬 Stremio Addon", url=f"{WORKER_URL}/manifest.json"),
+            InlineKeyboardButton("🌐 Web Dashboard", url=WORKER_URL)
+          ],
+          [
+            InlineKeyboardButton("🔍 Search Movies", switch_inline_query_current_chat=""),
+            InlineKeyboardButton("📢 Source Channels", callback_data="show_channels")
+          ]
+        ])
+        await message.reply_text(welcome_text, reply_markup=buttons, disable_web_page_preview=True)
+
+    @tg_client.on_message(filters.command("help"))
+    async def help_command(client: Client, message: Message):
+        help_text = (
+            "📖 **How to Use Telegram Movie Streamer Bot:**\n\n"
+            "1️⃣ **Search Movies:** Type `/search Avatar` or use inline search by typing `@botusername Avatar` in any chat.\n"
+            "2️⃣ **Forward Video:** Forward any movie file from allowed channels to get direct play & download links.\n"
+            "3️⃣ **Stremio Addon:** Copy the Stremio Manifest link from `/start` menu and add it into Stremio app.\n"
+            "4️⃣ **Direct Player:** Stream in VLC, Infuse, MX Player, or Web Browser with instant byte seeking."
+        )
+        await message.reply_text(help_text)
+
+    @tg_client.on_message(filters.command("channels"))
+    async def channels_command(client: Client, message: Message):
+        ch_list = "\n".join([f"• `{ch}`" for ch in ALLOWED_CHANNELS])
+        await message.reply_text(f"📢 **Whitelisted Source Channels:**\n\n{ch_list}")
+
+    @tg_client.on_message(filters.command("search"))
+    async def search_command(client: Client, message: Message):
+        query = " ".join(message.command[1:]).strip()
+        if not query:
+            await message.reply_text("⚠️ **Usage:** `/search <movie name>`\nExample: `/search Avatar`")
+            return
+
+        msg = await message.reply_text(f"🔍 Searching channels for **{query}**...")
+        found = False
+
+        for ch in ALLOWED_CHANNELS:
+            try:
+                chat_id = int(ch) if ch.startswith("-100") or ch.isdigit() else ch
+                async for m in client.search_messages(chat_id, query=query, limit=5):
+                    media = m.video or m.document or m.audio
+                    if media:
+                        found = True
+                        file_name = getattr(media, "file_name", None) or f"video_{m.id}.mp4"
+                        info = parse_media_info(file_name, media.file_size)
+                        stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={file_name}"
+                        dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={file_name}"
+
+                        caption = (
+                            f"🎬 **{file_name}**\n\n"
+                            f"📌 **Quality:** `{info['quality']}`\n"
+                            f"📦 **Size:** `{info['formatted_size']}`\n"
+                            f"🎧 **Audio:** `{info['audio']}`\n"
+                            f"⚡ **Codec:** `{info['codec']}`"
+                        )
+                        kb = InlineKeyboardMarkup([
+                          [
+                            InlineKeyboardButton("▶️ Direct Stream", url=stream_url),
+                            InlineKeyboardButton("📥 Download", url=dl_url)
+                          ],
+                          [
+                            InlineKeyboardButton("🍿 Play in Stremio", url=f"stremio://{WORKER_URL.replace('https://', '').replace('http://', '')}/stream/movie/tg:{ch}:{m.id}.json")
+                          ]
+                        ])
+                        await message.reply_text(caption, reply_markup=kb)
+            except Exception as e:
+                print(f"Error searching {ch}: {e}")
+
+        if not found:
+            await msg.edit_text(f"❌ No movies found matching **{query}** in source channels.")
+        else:
+            await msg.delete()
+
+    @tg_client.on_message(filters.media | filters.forwarded)
+    async def auto_link_generator(client: Client, message: Message):
+        media = message.video or message.document or message.audio
+        if not media:
+            return
+
+        chat_id = str(message.chat.id)
+        forward_chat = str(message.forward_from_chat.id) if message.forward_from_chat else ""
+
+        if chat_id in ALLOWED_CHANNELS or forward_chat in ALLOWED_CHANNELS:
+            target_ch = forward_chat if forward_chat in ALLOWED_CHANNELS else chat_id
+            msg_id = message.forward_from_message_id if message.forward_from_message_id else message.id
+            file_name = getattr(media, "file_name", None) or "video.mp4"
+            info = parse_media_info(file_name, media.file_size)
+
+            stream_url = f"{WORKER_URL}/stream/{target_ch}/{msg_id}?name={file_name}"
+            dl_url = f"{WORKER_URL}/dl/{target_ch}/{msg_id}?name={file_name}"
+
+            caption = (
+                f"⚡ **Direct Streamable Link Generated!**\n\n"
+                f"🎬 **File:** `{file_name}`\n"
+                f"📊 **Size:** `{info['formatted_size']}` | **Quality:** `{info['quality']}`"
+            )
+            kb = InlineKeyboardMarkup([
+              [
+                InlineKeyboardButton("▶️ Direct Stream", url=stream_url),
+                InlineKeyboardButton("📥 Download", url=dl_url)
+              ]
+            ])
+            await message.reply_text(caption, reply_markup=kb)
+
+    @tg_client.on_inline_query()
+    async def inline_search(client: Client, inline_query: InlineQuery):
+        query = inline_query.query.strip()
+        if not query or len(query) < 2:
+            return
+
+        results = []
+        for ch in ALLOWED_CHANNELS:
+            try:
+                chat_id = int(ch) if ch.startswith("-100") or ch.isdigit() else ch
+                async for m in client.search_messages(chat_id, query=query, limit=5):
+                    media = m.video or m.document or message.audio
+                    if media:
+                        file_name = getattr(media, "file_name", None) or f"video_{m.id}.mp4"
+                        info = parse_media_info(file_name, media.file_size)
+                        stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={file_name}"
+
+                        results.append(
+                            InlineQueryResultArticle(
+                                title=file_name,
+                                description=f"Quality: {info['quality']} | Size: {info['formatted_size']}",
+                                input_message_content=InputTextMessageContent(
+                                    f"🎬 **{file_name}**\n\n"
+                                    f"📌 **Quality:** `{info['quality']}`\n"
+                                    f"📦 **Size:** `{info['formatted_size']}`\n\n"
+                                    f"🔗 **Stream Link:** {stream_url}"
+                                ),
+                                reply_markup=InlineKeyboardMarkup([
+                                  [InlineKeyboardButton("▶️ Stream Now", url=stream_url)]
+                                ])
+                            )
+                        )
+            except Exception as e:
+                print(f"Inline search error: {e}")
+
+        await inline_query.answer(results, cache_time=300)
+
+
+# ================= FASTAPI WEB API ENDPOINTS =================
+
+@app.on_event("startup")
+async def startup():
+    print("🚀 Starting Telegram MTProto Engine & Bot Handlers...")
+    if tg_client:
+        try:
+            await tg_client.start()
+            print("✅ Telegram Bot Connected & Handlers Active!")
+        except Exception as e:
+            print(f"⚠️ Telegram Client Startup Error: {e}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    if tg_client and getattr(tg_client, "is_connected", False):
+        await tg_client.stop()
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "engine": "Hydrogram MTProto Direct Streamer & Telegram Bot Interface",
+        "version": "3.0.0",
+        "bot_active": tg_client is not None,
+        "channels": ALLOWED_CHANNELS,
+        "features": ["Bot /start", "/search", "Inline Query", "Auto Forward Link Generator"]
+    }
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "connected": tg_client.is_connected if (tg_client and hasattr(tg_client, 'is_connected')) else False
+    }
+
 @app.get("/search")
 async def search_channels(q: str = Query(..., min_length=2), channel_id: str = None):
     if not tg_client:
-        raise HTTPException(status_code=500, detail="Telegram credentials missing. Configure API_ID, API_HASH, BOT_TOKEN in Koyeb.")
+        raise HTTPException(status_code=500, detail="Telegram credentials missing.")
 
     results = []
     target_channels = [channel_id] if channel_id else ALLOWED_CHANNELS
@@ -160,7 +318,7 @@ async def get_recent_media(channel_id: str = None, limit: int = 20):
 @app.get("/stream/{channel_id}/{message_id}")
 async def stream_media(channel_id: str, message_id: int, request: Request):
     if not tg_client:
-        raise HTTPException(status_code=500, detail="Telegram credentials missing. Configure API_ID, API_HASH, BOT_TOKEN.")
+        raise HTTPException(status_code=500, detail="Telegram credentials missing.")
 
     retry_count = 0
     max_retries = 3
