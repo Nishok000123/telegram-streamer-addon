@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from hydrogram import Client, filters
 from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, InlineQuery, InlineQueryResultArticle, InputTextMessageContent
-from hydrogram.errors import FloodWait, RPCError
+from hydrogram.errors import FloodWait, RPCError, ChannelPrivate, ChatAdminRequired, UserNotParticipant, MessageIdInvalid
 
 API_ID_RAW = os.environ.get("API_ID", "").strip()
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
@@ -16,7 +16,7 @@ WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.nisho
 
 ALLOWED_CHANNELS = [c.strip() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
 
-app = FastAPI(title="Telegram Streamer MTProto Engine & Bot Interface", version="3.1.0")
+app = FastAPI(title="Telegram Streamer MTProto Engine & Bot Interface", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,8 +38,6 @@ if API_ID > 0 and API_HASH and BOT_TOKEN:
         )
     except Exception as init_err:
         print(f"❌ Hydrogram Client Init Error: {init_err}")
-else:
-    print(f"⚠️ Missing Credentials Config -> API_ID_VALID: {API_ID > 0}, API_HASH_SET: {bool(API_HASH)}, BOT_TOKEN_SET: {bool(BOT_TOKEN)}")
 
 def parse_media_info(file_name: str, file_size: int):
     name_lower = file_name.lower()
@@ -79,7 +77,8 @@ if tg_client:
             "• `/search <movie name>` — Search across channels\n"
             "• `/channels` — List source channels\n"
             "• `/help` — How to use this bot\n\n"
-            "💡 *Tip: Forward any video from your source channels to get instant stream links!*"
+            "⚠️ **IMPORTANT SETUP REQUIREMENT:**\n"
+            "Make sure to add this bot as **Admin** in your source channels so it can access your files!"
         )
         buttons = InlineKeyboardMarkup([
           [
@@ -97,17 +96,17 @@ if tg_client:
     async def help_command(client: Client, message: Message):
         help_text = (
             "📖 **How to Use Telegram Movie Streamer Bot:**\n\n"
-            "1️⃣ **Search Movies:** Type `/search Avatar` or use inline search by typing `@botusername Avatar` in any chat.\n"
-            "2️⃣ **Forward Video:** Forward any movie file from allowed channels to get direct play & download links.\n"
-            "3️⃣ **Stremio Addon:** Copy the Stremio Manifest link from `/start` menu and add it into Stremio app.\n"
-            "4️⃣ **Direct Player:** Stream in VLC, Infuse, MX Player, or Web Browser with instant byte seeking."
+            "1️⃣ **Add Bot to Channel:** Add `@yourbotname` as an **Administrator** in your source channels.\n"
+            "2️⃣ **Search Movies:** Type `/search Avatar` or use inline search by typing `@botusername Avatar` in any chat.\n"
+            "3️⃣ **Forward Video:** Forward any movie file from allowed channels to get direct play & download links.\n"
+            "4️⃣ **Stremio Addon:** Copy the Stremio Manifest link from `/start` menu and add it into Stremio app."
         )
         await message.reply_text(help_text)
 
     @tg_client.on_message(filters.command("channels"))
     async def channels_command(client: Client, message: Message):
         ch_list = "\n".join([f"• `{ch}`" for ch in ALLOWED_CHANNELS])
-        await message.reply_text(f"📢 **Whitelisted Source Channels:**\n\n{ch_list}")
+        await message.reply_text(f"📢 **Whitelisted Source Channels:**\n\n{ch_list}\n\n⚠️ *Make sure the bot is an Admin in all these channels!*")
 
     @tg_client.on_message(filters.command("search"))
     async def search_command(client: Client, message: Message):
@@ -148,11 +147,13 @@ if tg_client:
                           ]
                         ])
                         await message.reply_text(caption, reply_markup=kb)
+            except ChannelPrivate:
+                print(f"⚠️ Bot is not in channel {ch} or channel is private. Add bot as Admin.")
             except Exception as e:
                 print(f"Error searching {ch}: {e}")
 
         if not found:
-            await msg.edit_text(f"❌ No movies found matching **{query}** in source channels.")
+            await msg.edit_text(f"❌ No movies found matching **{query}** in source channels.\n\n💡 *Note: Ensure the bot is added as Admin in your channels!*")
         else:
             await msg.delete()
 
@@ -224,6 +225,9 @@ if tg_client:
 
         await inline_query.answer(results, cache_time=300)
 
+
+# ================= FASTAPI WEB API ENDPOINTS =================
+
 @app.on_event("startup")
 async def startup():
     print("🚀 Starting Telegram MTProto Engine & Bot Handlers...")
@@ -244,16 +248,12 @@ def health_check():
     return {
         "status": "online",
         "engine": "Hydrogram MTProto Direct Streamer & Telegram Bot Interface",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "worker_url": WORKER_URL,
         "credentials_configured": tg_client is not None,
-        "diagnostics": {
-            "api_id_valid": API_ID > 0,
-            "api_id_raw_len": len(API_ID_RAW),
-            "api_hash_present": bool(API_HASH),
-            "bot_token_present": bool(BOT_TOKEN)
-        },
-        "channels": ALLOWED_CHANNELS
+        "connected": tg_client.is_connected if (tg_client and hasattr(tg_client, 'is_connected')) else False,
+        "channels": ALLOWED_CHANNELS,
+        "instructions": "Ensure @yourbot is added as Administrator in all source channels."
     }
 
 @app.get("/health")
@@ -287,6 +287,8 @@ async def search_channels(q: str = Query(..., min_length=2), channel_id: str = N
                         "mime_type": getattr(media, "mime_type", "video/mp4"),
                         "info": info
                     })
+        except ChannelPrivate:
+            print(f"⚠️ ChannelPrivate error for {ch}: Bot is not an Admin in channel.")
         except Exception as e:
             print(f"Error searching channel {ch}: {e}")
 
@@ -332,14 +334,20 @@ async def stream_media(channel_id: str, message_id: int, request: Request):
     while retry_count < max_retries:
         try:
             chat_id = int(channel_id) if channel_id.startswith("-100") or channel_id.isdigit() else channel_id
-            message = await tg_client.get_messages(chat_id, message_id)
+            
+            try:
+                message = await tg_client.get_messages(chat_id, message_id)
+            except ChannelPrivate:
+                raise HTTPException(status_code=403, detail=f"Bot is not an Admin in channel {channel_id}. Add the bot as Admin in Telegram.")
+            except MessageIdInvalid:
+                raise HTTPException(status_code=404, detail=f"Message ID {message_id} not found in channel {channel_id}.")
 
             if not message:
                 raise HTTPException(status_code=404, detail="Message not found")
 
             media = message.video or message.document or message.audio
             if not media:
-                raise HTTPException(status_code=404, detail="No streamable media in this message")
+                raise HTTPException(status_code=404, detail="No streamable video or audio file found in this message")
 
             file_size = media.file_size
             mime_type = getattr(media, "mime_type", None) or "video/mp4"
@@ -381,6 +389,8 @@ async def stream_media(channel_id: str, message_id: int, request: Request):
             print(f"⚠️ Telegram Rate Limit FloodWait: Sleeping for {fw.value}s")
             await asyncio.sleep(fw.value)
             retry_count += 1
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"Error serving stream {channel_id}/{message_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
