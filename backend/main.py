@@ -484,28 +484,47 @@ async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, 
             CACHE_HIT += 1
             return cached
     CACHE_MISS += 1
+
+    # Telegram search is literal. "obsession 2026" misses "Obsession (2025)".
+    # Also strip common typo-ish extra tokens: try full query, then without year.
+    queries = []
+    raw = q.strip()
+    queries.append(raw)
+    no_year = re.sub(r"\b(19|20)\d{2}\b", " ", raw).strip()
+    no_year = re.sub(r"\s+", " ", no_year)
+    if no_year and no_year.lower() != raw.lower():
+        queries.append(no_year)
+
     results = []
+    seen = set()
     targets = [channel_id] if channel_id else ALLOWED_CHANNELS
-    for ch in targets:
-        try:
-            async for msg in tg_client.search_messages(int(ch), query=q, limit=20):
-                media = msg.video or msg.document or msg.audio
-                if not media:
-                    continue
-                fname = getattr(media, "file_name", None) or f"file_{msg.id}.mp4"
-                info = parse_media_info(fname, media.file_size)
-                if enriched.lower() == "true" and TMDB_API_KEY:
-                    info = await enrich_media_info(info)
-                results.append({
-                    "channel_id": ch,
-                    "message_id": msg.id,
-                    "file_name": fname,
-                    "file_size": media.file_size,
-                    "mime_type": getattr(media, "mime_type", "video/mp4"),
-                    "info": info,
-                })
-        except Exception as e:
-            print(f"Search error {ch}: {e}")
+    for query in queries:
+        for ch in targets:
+            try:
+                async for msg in tg_client.search_messages(int(ch), query=query, limit=20):
+                    media = msg.video or msg.document or msg.audio
+                    if not media:
+                        continue
+                    key = (ch, msg.id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fname = getattr(media, "file_name", None) or f"file_{msg.id}.mp4"
+                    info = parse_media_info(fname, media.file_size)
+                    if enriched.lower() == "true" and TMDB_API_KEY:
+                        info = await enrich_media_info(info)
+                    results.append({
+                        "channel_id": ch,
+                        "message_id": msg.id,
+                        "file_name": fname,
+                        "file_size": media.file_size,
+                        "mime_type": getattr(media, "mime_type", "video/mp4"),
+                        "info": info,
+                    })
+            except Exception as e:
+                print(f"Search error {ch}: {e}")
+        if results:
+            break
     body = {"query": q, "total": len(results), "results": results}
     SEARCH_CACHE[cache_key] = (now, body)
     return body

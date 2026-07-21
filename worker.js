@@ -146,7 +146,7 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 function stremioManifest(origin) {
   return new Response(JSON.stringify({
     id: 'io.darkwave.stream',
-    version: '4.5.2',
+    version: '4.5.3',
     name: '🌊 DarkWave Stream',
     description: 'Private high-speed streaming from curated Telegram sources — powered by MTProto & Cloudflare Edge.',
     logo: 'https://i.imgur.com/5ZNRcqH.png',
@@ -284,7 +284,7 @@ async function stremioStream(path, url, env, origin) {
   if (id.startsWith('tg:')) {
     const parts = id.split(':');
     if (parts.length >= 3) {
-      // Most Telegram sources are MKV; mp4 label lied to players. Mime comes from backend.
+      // Prefer real mime from backend; most sources are MKV.
       const streamUrl = `${origin}/stream/${parts[1]}/${parts[2]}?name=stream.mkv`;
       streams.push({
         name: '🌊 DarkWave',
@@ -293,7 +293,6 @@ async function stremioStream(path, url, env, origin) {
         behaviorHints: {
           bingeGroup: `darkwave-${parts[1]}-${parts[2]}`,
           filename: 'stream.mkv',
-          notWebReady: true,
         },
       });
     }
