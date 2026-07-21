@@ -6,5 +6,5 @@ compatibility_date = "2024-01-01"
 # Live Koyeb MTProto Backend Engine
 TELEGRAM_API_URL = "https://retail-mallory-nishokroshan07-1aa75de1.koyeb.app"
 
-# Whitelisted Source Channels
-ALLOWED_CHANNELS = "-1003967652604,-1002502061360,-1003916531716"
+# Whitelisted Source Channels (must match backend ALLOWED_CHANNELS)
+ALLOWED_CHANNELS = "-1003916531716,-1002502061360,-1003967652604,-1002708448330"
