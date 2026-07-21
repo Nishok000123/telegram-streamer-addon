@@ -90,7 +90,8 @@ async function stremioStream(path, env, origin) {
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'no-cache',
+      // Cache source lists briefly so reopen / binge is snappy
+      'Cache-Control': 'public, max-age=60',
     },
   });
 }
@@ -118,24 +119,40 @@ async function streamsFromImdb(id, type, env, origin) {
   const year = extractYear(meta.year || meta.releaseInfo);
   const queries = buildSearchQueries(meta.name, year, season, episode);
 
-  const results = [];
-  const seen = new Set();
-  for (const q of queries) {
+  // Two-wave parallel search: primary queries first, then year±1 fallback only if needed.
+  // Avoids hammering Telegram with 4×channels RPCs every play click.
+  const primary = queries.slice(0, Math.min(2, queries.length));
+  const fallback = queries.slice(primary.length);
+
+  async function fetchQuery(q) {
     try {
       const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}`);
-      if (!res.ok) continue;
+      if (!res.ok) return [];
       const data = await res.json();
-      for (const item of data.results || []) {
-        const key = `${item.channel_id}:${item.message_id}`;
-        if (seen.has(key)) continue;
-        if (!matchesMeta(item, meta.name, year, season, episode, type)) continue;
-        seen.add(key);
-        results.push(item);
-      }
+      return data.results || [];
     } catch (_) {
-      /* try next query */
+      return [];
     }
-    if (results.length >= 15) break;
+  }
+
+  const results = [];
+  const seen = new Set();
+  function ingest(items) {
+    for (const item of items) {
+      const key = `${item.channel_id}:${item.message_id}`;
+      if (seen.has(key)) continue;
+      if (!matchesMeta(item, meta.name, year, season, episode, type)) continue;
+      seen.add(key);
+      results.push(item);
+    }
+  }
+
+  const primaryHits = await Promise.all(primary.map(fetchQuery));
+  for (const items of primaryHits) ingest(items);
+
+  if (results.length < 3 && fallback.length) {
+    const more = await Promise.all(fallback.map(fetchQuery));
+    for (const items of more) ingest(items);
   }
 
   // Prefer exact/near year, then quality
@@ -366,7 +383,7 @@ async function mediaProxy(request, env, url, forceDownload) {
       'Access-Control-Allow-Origin': '*',
       'Accept-Ranges': 'bytes',
       'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=60',
+      'Cache-Control': 'public, max-age=3600',
       'CF-Cache-Status': 'DYNAMIC',
       'Content-Disposition': forceDownload
         ? `attachment; filename="${encodeURIComponent(fileName)}"`

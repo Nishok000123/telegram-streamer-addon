@@ -56,13 +56,19 @@ ALLOWED_CHANNELS = [
 BOT_USERNAME = ""
 BOT_LINK = ""
 
-app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.2.0")
+app = FastAPI(title="Telegram Streamer MTProto Engine", version="4.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Pyrogram get_file is not safe under concurrent streams on one client —
 # interleaved chunks blow past Content-Length ("Too much data for declared Content-Length").
+# Hold the lock across a small batch so we pay one acquire per ~4 MiB, not per 1 MiB.
 DOWNLOAD_SEM = asyncio.Semaphore(1)
 CHUNK_SIZE = 1024 * 1024
+PREFETCH_CHUNKS = 4  # fetch 4 consecutive Telegram chunks per lock hold
+
+# Cache get_messages metadata so Range probes / seeks skip repeated peer RPCs.
+MSG_CACHE = {}  # (channel_id, message_id) -> (ts, msg)
+MSG_CACHE_TTL = 600
 
 # User session = channel search + streaming.
 # Bot commands/inline use Telegram HTTP webhooks (no Pyrogram bot_client polling).
@@ -191,12 +197,12 @@ TMDB_CACHE_TTL = 86400  # 24 hours
 # ── Search Result Cache ────────────────────────────────────────────────────────
 
 SEARCH_CACHE = {}  # (query, channel_id) -> (timestamp, data)
-SEARCH_CACHE_TTL = 60  # 60 seconds
+SEARCH_CACHE_TTL = 120  # seconds
 CACHE_HIT, CACHE_MISS = 0, 0  # stats
 
 
-async def tmdb_search(query: str, year: int = None, media_type: str = "movie"):
-    """Search TMDB and return first match metadata. Returns None if no key or no match."""
+def _tmdb_search_sync(query: str, year: int = None, media_type: str = "movie"):
+    """Blocking TMDB lookup — run via asyncio.to_thread so the event loop stays free."""
     if not TMDB_API_KEY:
         return None
     cache_key = f"{media_type}:{query.lower().strip()}:{year}"
@@ -209,14 +215,13 @@ async def tmdb_search(query: str, year: int = None, media_type: str = "movie"):
         url = f"https://api.themoviedb.org/3/search/{media_type}?api_key={TMDB_API_KEY}&query={query}"
         if year:
             url += f"&year={year}"
-        resp = requests.get(url, timeout=5)
+        resp = requests.get(url, timeout=3)
         if resp.status_code != 200:
             return None
         results = resp.json().get("results", [])
         if not results:
-            # Try without year
             url_no_year = f"https://api.themoviedb.org/3/search/{media_type}?api_key={TMDB_API_KEY}&query={query}"
-            resp2 = requests.get(url_no_year, timeout=5)
+            resp2 = requests.get(url_no_year, timeout=3)
             if resp2.status_code == 200:
                 results = resp2.json().get("results", [])
             if not results:
@@ -237,6 +242,11 @@ async def tmdb_search(query: str, year: int = None, media_type: str = "movie"):
     except Exception as e:
         print(f"TMDB error: {e}")
         return None
+
+
+async def tmdb_search(query: str, year: int = None, media_type: str = "movie"):
+    """Search TMDB and return first match metadata. Returns None if no key or no match."""
+    return await asyncio.to_thread(_tmdb_search_sync, query, year, media_type)
 
 
 # ── Build Rich Metadata ───────────────────────────────────────────────────────
@@ -261,15 +271,20 @@ async def enrich_media_info(info: dict):
 
 # ── BOT API (HTTP webhooks — wakes Koyeb on each message) ─────────────────────
 
-def bot_api(method: str, **payload):
+def _bot_api_sync(method: str, **payload):
     if not BOT_TOKEN:
         return {"ok": False}
     r = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
         json=payload,
-        timeout=60,
+        timeout=12,
     )
     return r.json()
+
+
+async def bot_api(method: str, **payload):
+    """Non-blocking Bot API call (sync requests off the event loop)."""
+    return await asyncio.to_thread(_bot_api_sync, method, **payload)
 
 
 def _ikb(rows):
@@ -277,73 +292,82 @@ def _ikb(rows):
     return {"inline_keyboard": rows}
 
 
+async def _search_channel(ch: str, query: str, limit: int = 8):
+    """Search one channel; return list of (ch, msg, media) hits."""
+    hits = []
+    try:
+        async for m in tg_client.search_messages(int(ch), query=query, limit=limit):
+            media = m.video or m.document or m.audio
+            if not media:
+                continue
+            hits.append((ch, m, media))
+            if len(hits) >= limit:
+                break
+    except Exception as e:
+        print(f"Search error {ch}: {e}")
+    return hits
+
+
 async def _bot_search_and_reply(chat_id: int, query: str):
     if not tg_client:
-        bot_api("sendMessage", chat_id=chat_id, text="❌ Search backend not connected.", parse_mode="Markdown")
+        await bot_api("sendMessage", chat_id=chat_id, text="❌ Search backend not connected.", parse_mode="Markdown")
         return
 
     print(f"[bot] /search {query!r} chat={chat_id}")
-    status = bot_api(
+    status = await bot_api(
         "sendMessage",
         chat_id=chat_id,
         text=f"🔍 Searching for **{query}**…",
         parse_mode="Markdown",
     )
     status_id = (status.get("result") or {}).get("message_id")
-    found = 0
     max_results = 8
 
-    for ch in ALLOWED_CHANNELS:
+    # Parallel channel search — biggest bot latency win vs sequential waits.
+    channel_hits = await asyncio.gather(
+        *[_search_channel(ch, query, limit=6) for ch in ALLOWED_CHANNELS]
+    )
+    found = 0
+    for hits in channel_hits:
+        for ch, m, media in hits:
+            if found >= max_results:
+                break
+            found += 1
+            fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
+            # Skip TMDB on bot hot path — parse filename only (quality/size/year).
+            info = parse_media_info(fname, media.file_size)
+            stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
+            dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={fname}"
+
+            extras = []
+            if info.get("year"):
+                extras.append(f"📅 {info['year']}")
+            if info.get("source") and info["source"] != "Unknown":
+                extras.append(f"📀 {info['source']}")
+            extras_str = ("\n" + " | ".join(extras)) if extras else ""
+
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=(
+                    f"🎬 **{fname}**\n"
+                    f"📌 {info['quality']} | {info['source']} | 📦 {info['size']}"
+                    f"{extras_str}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=_ikb([[
+                    {"text": "▶️ Stream", "url": stream_url},
+                    {"text": "📥 Download", "url": dl_url},
+                ]]),
+            )
         if found >= max_results:
             break
-        try:
-            async for m in tg_client.search_messages(int(ch), query=query, limit=10):
-                if found >= max_results:
-                    break
-                media = m.video or m.document or m.audio
-                if not media:
-                    continue
-                found += 1
-                fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-                info = await enrich_media_info(parse_media_info(fname, media.file_size))
-                stream_url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
-                dl_url = f"{WORKER_URL}/dl/{ch}/{m.id}?name={fname}"
-
-                extras = []
-                if info.get("year"):
-                    extras.append(f"📅 {info['year']}")
-                if info.get("source") and info["source"] != "Unknown":
-                    extras.append(f"📀 {info['source']}")
-                extras_str = ("\n" + " | ".join(extras)) if extras else ""
-
-                tmdb_block = ""
-                tmdb = info.get("tmdb")
-                if tmdb and tmdb.get("vote_average"):
-                    tmdb_block = f"\n⭐ {tmdb['vote_average']}/10"
-
-                bot_api(
-                    "sendMessage",
-                    chat_id=chat_id,
-                    text=(
-                        f"🎬 **{fname}**\n"
-                        f"📌 {info['quality']} | {info['source']} | 📦 {info['size']}"
-                        f"{extras_str}"
-                        f"{tmdb_block}"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=_ikb([[
-                        {"text": "▶️ Stream", "url": stream_url},
-                        {"text": "📥 Download", "url": dl_url},
-                    ]]),
-                )
-        except Exception as e:
-            print(f"Search error {ch}: {e}")
 
     if status_id:
         if found:
-            bot_api("deleteMessage", chat_id=chat_id, message_id=status_id)
+            await bot_api("deleteMessage", chat_id=chat_id, message_id=status_id)
         else:
-            bot_api(
+            await bot_api(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=status_id,
@@ -360,9 +384,8 @@ async def _bot_handle_message(message: dict):
 
     text = (message.get("text") or "").strip()
     if not text:
-        # Forwarded/media hint (no pyrogram peer helpers in webhook path)
         if message.get("video") or message.get("document") or message.get("audio") or message.get("forward_from_chat"):
-            bot_api(
+            await bot_api(
                 "sendMessage",
                 chat_id=chat_id,
                 text="Forward a video **from a source channel**, or use `/search <title>`.",
@@ -375,7 +398,7 @@ async def _bot_handle_message(message: dict):
 
     if cmd == "/start":
         print(f"[bot] /start from {(message.get('from') or {}).get('id', '?')}")
-        bot_api(
+        await bot_api(
             "sendMessage",
             chat_id=chat_id,
             text=(
@@ -396,7 +419,7 @@ async def _bot_handle_message(message: dict):
 
     if cmd == "/help":
         uname = f"@{BOT_USERNAME}" if BOT_USERNAME else "@your_bot"
-        bot_api(
+        await bot_api(
             "sendMessage",
             chat_id=chat_id,
             text=(
@@ -412,7 +435,7 @@ async def _bot_handle_message(message: dict):
 
     if cmd == "/channels":
         lines = "\n".join(f"• `{ch}`" for ch in ALLOWED_CHANNELS)
-        bot_api(
+        await bot_api(
             "sendMessage",
             chat_id=chat_id,
             text=f"📢 **Source Channels:**\n\n{lines}",
@@ -423,12 +446,11 @@ async def _bot_handle_message(message: dict):
     if cmd == "/search":
         query = " ".join(args).strip()
         if not query:
-            bot_api("sendMessage", chat_id=chat_id, text="Usage: `/search <movie title>`", parse_mode="Markdown")
+            await bot_api("sendMessage", chat_id=chat_id, text="Usage: `/search <movie title>`", parse_mode="Markdown")
             return
         await _bot_search_and_reply(chat_id, query)
         return
 
-    # Private free-text → search
     if chat.get("type") == "private" and len(text) >= 2 and not text.startswith("/"):
         await _bot_search_and_reply(chat_id, text)
 
@@ -439,7 +461,7 @@ async def _bot_handle_inline(inline_query: dict):
     if not iq_id:
         return
     if len(q) < 2:
-        bot_api(
+        await bot_api(
             "answerInlineQuery",
             inline_query_id=iq_id,
             results=[],
@@ -449,46 +471,44 @@ async def _bot_handle_inline(inline_query: dict):
         )
         return
     if not tg_client:
-        bot_api("answerInlineQuery", inline_query_id=iq_id, results=[], cache_time=5)
+        await bot_api("answerInlineQuery", inline_query_id=iq_id, results=[], cache_time=5)
         return
 
+    # Parallel channel search; no TMDB — answerInlineQuery has a ~10s budget.
+    channel_hits = await asyncio.gather(
+        *[_search_channel(ch, q, limit=4) for ch in ALLOWED_CHANNELS]
+    )
     results = []
-    for ch in ALLOWED_CHANNELS:
+    for hits in channel_hits:
+        for ch, m, media in hits:
+            if len(results) >= 8:
+                break
+            fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
+            info = parse_media_info(fname, media.file_size)
+            url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
+            desc_parts = [p for p in [info["quality"], info.get("source"), info["size"]] if p and p != "Unknown"]
+            desc = " | ".join(desc_parts)
+            if info.get("year"):
+                desc = f"{info['year']} · {desc}"
+            results.append({
+                "type": "article",
+                "id": f"{ch}_{m.id}",
+                "title": (info.get("title") or fname)[:64],
+                "description": desc[:120],
+                "input_message_content": {
+                    "message_text": (
+                        f"🎬 **{fname}**\n"
+                        f"📌 {info['quality']} | {info.get('source', '?')} | 📦 {info['size']}\n"
+                        f"🔗 {url}"
+                    ),
+                    "parse_mode": "Markdown",
+                },
+                "reply_markup": _ikb([[{"text": "▶️ Stream Now", "url": url}]]),
+            })
         if len(results) >= 8:
             break
-        try:
-            async for m in tg_client.search_messages(int(ch), query=q, limit=5):
-                if len(results) >= 8:
-                    break
-                media = m.video or m.document or m.audio
-                if not media:
-                    continue
-                fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-                info = await enrich_media_info(parse_media_info(fname, media.file_size))
-                url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
-                desc_parts = [p for p in [info["quality"], info.get("source"), info["size"]] if p and p != "Unknown"]
-                desc = " | ".join(desc_parts)
-                if info.get("year"):
-                    desc = f"{info['year']} · {desc}"
-                results.append({
-                    "type": "article",
-                    "id": f"{ch}_{m.id}",
-                    "title": (info.get("title") or fname)[:64],
-                    "description": desc[:120],
-                    "input_message_content": {
-                        "message_text": (
-                            f"🎬 **{fname}**\n"
-                            f"📌 {info['quality']} | {info.get('source', '?')} | 📦 {info['size']}\n"
-                            f"🔗 {url}"
-                        ),
-                        "parse_mode": "Markdown",
-                    },
-                    "reply_markup": _ikb([[{"text": "▶️ Stream Now", "url": url}]]),
-                })
-        except Exception as e:
-            print(f"Inline error {ch}: {e}")
 
-    bot_api("answerInlineQuery", inline_query_id=iq_id, results=results, cache_time=60)
+    await bot_api("answerInlineQuery", inline_query_id=iq_id, results=results, cache_time=60)
 
 
 # ── FASTAPI ENDPOINTS ─────────────────────────────────────────────────────────
@@ -528,7 +548,7 @@ async def _boot_telegram():
 
     if BOT_TOKEN:
         try:
-            me = bot_api("getMe")
+            me = await bot_api("getMe")
             if me.get("ok"):
                 BOT_USERNAME = (me["result"].get("username") or "")
                 BOT_LINK = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
@@ -539,7 +559,7 @@ async def _boot_telegram():
             else:
                 print(f"⚠️  getMe failed: {me}")
 
-            bot_api(
+            await bot_api(
                 "setMyCommands",
                 commands=[
                     {"command": "start", "description": "Start the bot"},
@@ -550,7 +570,7 @@ async def _boot_telegram():
             )
 
             webhook_url = f"{BACKEND_URL}/telegram/webhook"
-            wh = bot_api(
+            wh = await bot_api(
                 "setWebhook",
                 url=webhook_url,
                 drop_pending_updates=True,
@@ -580,13 +600,7 @@ async def shutdown():
         await tg_client.stop()
 
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        update = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-
+async def _process_telegram_update(update: dict):
     try:
         if "message" in update:
             await _bot_handle_message(update["message"])
@@ -595,6 +609,18 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         print(f"[webhook] handler error: {e}")
 
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Ack Telegram immediately; process search/commands in background.
+    Holding the webhook until search finishes makes the bot feel like a turtle
+    and causes Telegram to retry (duplicate replies)."""
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    asyncio.create_task(_process_telegram_update(update))
     return {"ok": True}
 
 
@@ -603,7 +629,7 @@ def root():
     mode = "user_session" if SESSION_STRING else ("bot_token" if BOT_TOKEN else "none")
     return {
         "status": "online",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "mode": mode,
         "bot_mode": "webhook",
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
@@ -619,7 +645,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "bot_mode": "webhook",
         "connected": getattr(tg_client, "is_connected", False) if tg_client else False,
         "bot": bool(BOT_TOKEN),
@@ -674,31 +700,31 @@ async def search_api(q: str = Query(..., min_length=2), channel_id: str = None, 
     results = []
     seen = set()
     targets = [channel_id] if channel_id else ALLOWED_CHANNELS
+    do_enrich = enriched.lower() == "true" and bool(TMDB_API_KEY)
+
     for query in queries:
-        for ch in targets:
-            try:
-                async for msg in tg_client.search_messages(int(ch), query=query, limit=20):
-                    media = msg.video or msg.document or msg.audio
-                    if not media:
-                        continue
-                    key = (ch, msg.id)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    fname = getattr(media, "file_name", None) or f"file_{msg.id}.mp4"
-                    info = parse_media_info(fname, media.file_size)
-                    if enriched.lower() == "true" and TMDB_API_KEY:
-                        info = await enrich_media_info(info)
-                    results.append({
-                        "channel_id": ch,
-                        "message_id": msg.id,
-                        "file_name": fname,
-                        "file_size": media.file_size,
-                        "mime_type": getattr(media, "mime_type", "video/mp4"),
-                        "info": info,
-                    })
-            except Exception as e:
-                print(f"Search error {ch}: {e}")
+        # Search all channels in parallel for this query variant.
+        channel_hits = await asyncio.gather(
+            *[_search_channel(ch, query, limit=20) for ch in targets]
+        )
+        for hits in channel_hits:
+            for ch, msg, media in hits:
+                key = (ch, msg.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                fname = getattr(media, "file_name", None) or f"file_{msg.id}.mp4"
+                info = parse_media_info(fname, media.file_size)
+                if do_enrich:
+                    info = await enrich_media_info(info)
+                results.append({
+                    "channel_id": ch,
+                    "message_id": msg.id,
+                    "file_name": fname,
+                    "file_size": media.file_size,
+                    "mime_type": getattr(media, "mime_type", "video/mp4"),
+                    "info": info,
+                })
         if results:
             break
     body = {"query": q, "total": len(results), "results": results}
@@ -754,39 +780,67 @@ async def tmdb_search_api(q: str = Query(..., min_length=2), year: int = None, m
         raise HTTPException(404, "No match found.")
     return data
 
-async def _fetch_one_chunk(msg, chunk_index: int) -> bytes:
-    """Fetch a single 1 MiB Telegram chunk under the download lock, then release."""
+async def _get_cached_message(channel_id: str, message_id: int):
+    """Return message object, using a short TTL cache to skip repeated get_messages RPCs."""
+    key = (str(channel_id), int(message_id))
+    now = time.time()
+    cached = MSG_CACHE.get(key)
+    if cached:
+        ts, msg = cached
+        if now - ts < MSG_CACHE_TTL:
+            return msg
+    msg = await tg_client.get_messages(int(channel_id), message_id)
+    MSG_CACHE[key] = (now, msg)
+    # Bound cache size (simple FIFO-ish prune)
+    if len(MSG_CACHE) > 512:
+        oldest = sorted(MSG_CACHE.items(), key=lambda kv: kv[1][0])[:128]
+        for k, _ in oldest:
+            MSG_CACHE.pop(k, None)
+    return msg
+
+
+async def _fetch_chunk_batch(msg, start_index: int, count: int) -> list:
+    """Fetch up to `count` consecutive 1 MiB Telegram chunks under one lock hold."""
+    chunks = []
     async with DOWNLOAD_SEM:
-        async for raw in tg_client.stream_media(msg, offset=chunk_index, limit=1):
-            return bytes(raw)
-    return b""
+        async for raw in tg_client.stream_media(msg, offset=start_index, limit=count):
+            chunks.append(bytes(raw))
+            if len(chunks) >= count:
+                break
+    return chunks
 
 
 async def _read_telegram_range(msg, start: int, length: int):
-    """Yield exact byte range. Lock only per Telegram chunk so seeks are not blocked."""
+    """Yield exact byte range. Prefetch several chunks per lock to cut round-trips."""
     offset_chunks = start // CHUNK_SIZE
     skip_front = start % CHUNK_SIZE
     limit_chunks = (skip_front + length + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     sent = 0
     trim = skip_front
-    for i in range(limit_chunks):
-        chunk = await _fetch_one_chunk(msg, offset_chunks + i)
-        if not chunk:
+    i = 0
+    while i < limit_chunks:
+        batch_n = min(PREFETCH_CHUNKS, limit_chunks - i)
+        batch = await _fetch_chunk_batch(msg, offset_chunks + i, batch_n)
+        if not batch:
             break
-        if trim:
-            if trim >= len(chunk):
-                trim -= len(chunk)
-                continue
-            chunk = chunk[trim:]
-            trim = 0
-        if sent + len(chunk) > length:
-            chunk = chunk[: length - sent]
-        if not chunk:
-            break
-        sent += len(chunk)
-        yield chunk
-        if sent >= length:
+        for chunk in batch:
+            i += 1
+            if trim:
+                if trim >= len(chunk):
+                    trim -= len(chunk)
+                    continue
+                chunk = chunk[trim:]
+                trim = 0
+            if sent + len(chunk) > length:
+                chunk = chunk[: length - sent]
+            if not chunk:
+                return
+            sent += len(chunk)
+            yield chunk
+            if sent >= length:
+                return
+        if len(batch) < batch_n:
             break
 
 
@@ -796,9 +850,8 @@ async def stream_api(channel_id: str, message_id: int, request: Request):
         raise HTTPException(500, "No Telegram client configured.")
     for attempt in range(3):
         try:
-            chat_id = int(channel_id)
             try:
-                msg = await tg_client.get_messages(chat_id, message_id)
+                msg = await _get_cached_message(channel_id, message_id)
             except ChannelPrivate:
                 raise HTTPException(403, f"Cannot access channel {channel_id}. Use SESSION_STRING mode.")
             except MessageIdInvalid:
