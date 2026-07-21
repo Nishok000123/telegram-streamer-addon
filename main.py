@@ -14,6 +14,15 @@ from pyrogram.types import (
 from pyrogram.errors import FloodWait, ChannelPrivate, MessageIdInvalid
 
 
+# ── Override MIN_CHANNEL_ID to accept modern large channel IDs ──
+# Older Pyrogram versions (pre-2.1) have MIN_CHANNEL_ID = -1002147483647
+# which rejects channel IDs more negative than that threshold.
+# Modern Telegram channels often exceed this limit.
+import pyrogram.utils
+if pyrogram.utils.MIN_CHANNEL_ID > -100999999999999:
+    pyrogram.utils.MIN_CHANNEL_ID = -100999999999999
+
+
 # ── Monkey-patch Pyrogram's handle_updates to catch ValueError on unresolvable peers ──
 _original_handle_updates = Client.handle_updates
 
