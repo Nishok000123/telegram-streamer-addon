@@ -135,14 +135,15 @@ async function mediaProxy(request, env, ctx, url, forceDownload) {
 
 function stremioManifest(origin) {
   return new Response(JSON.stringify({
-    id: 'org.telegram.direct.streaming.addon',
+    id: 'io.darkwave.stream',
     version: '4.0.0',
-    name: 'Telegram Direct Streamer',
-    description: 'Private high-speed Telegram channel video streaming via Cloudflare Edge.',
+    name: '🌊 DarkWave Stream',
+    description: 'Private high-speed streaming from curated Telegram sources — powered by MTProto & Cloudflare Edge.',
+    logo: 'https://i.imgur.com/5ZNRcqH.png',
     resources: ['stream', 'catalog'],
     types: ['movie', 'series', 'other'],
     idPrefixes: ['tg:'],
-    catalogs: [{ type: 'movie', id: 'telegram-recent', name: 'Telegram Source Movies' }],
+    catalogs: [{ type: 'movie', id: 'darkwave-latest', name: '🎬 DarkWave Latest' }],
     behaviorHints: { configurable: false, configurationRequired: false },
   }, null, 2), {
     headers: {
@@ -184,8 +185,8 @@ async function stremioStream(path, url, env, origin) {
     if (parts.length >= 3) {
       const streamUrl = `${origin}/stream/${parts[1]}/${parts[2]}?name=stream.mp4`;
       streams.push({
-        name: '⚡ Telegram Edge Stream',
-        title: `Direct Stream | 1080p/4K`,
+        name: '🌊 DarkWave',
+        title: `Edge Stream | 1080p / 4K`,
         url: streamUrl,
         behaviorHints: { notSupported: false, isFree: true },
       });
