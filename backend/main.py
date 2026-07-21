@@ -542,58 +542,97 @@ async def _bot_search_and_reply(chat_id: int, query: str):
         parse_mode="Markdown",
     )
     status_id = (status.get("result") or {}).get("message_id")
-    max_results = 8
+    max_results = 5
 
-    # Prefer index hit first (no Telegram round-trip)
-    qlow = query.lower().strip()
-    indexed = [
-        i for i in (MEDIA_INDEX.get("items") or [])
-        if qlow in (i.get("file_name") or "").lower()
-        or qlow in ((i.get("info") or {}).get("title") or "").lower()
-    ][:max_results]
+    scored = []
 
-    if indexed:
-        for item in indexed:
-            await _bot_send_index_item(chat_id, item)
-        if status_id:
-            await bot_api("deleteMessage", chat_id=chat_id, message_id=status_id)
-        return
+    # Prefer index — score & require title tokens (less junk)
+    for i in (MEDIA_INDEX.get("items") or []):
+        s = _match_score(query, i)
+        if s > 0:
+            scored.append((s, i))
 
-    # Parallel channel search — biggest bot latency win vs sequential waits.
-    channel_hits = await asyncio.gather(
-        *[_search_channel(ch, query, limit=6) for ch in ALLOWED_CHANNELS]
-    )
-    found = 0
-    for hits in channel_hits:
-        for ch, m, media in hits:
-            if found >= max_results:
-                break
-            found += 1
-            fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-            info = parse_media_info(fname, media.file_size, channel_id=ch)
-            item = {
-                "id": f"{ch}:{m.id}",
-                "channel_id": ch,
-                "message_id": m.id,
-                "file_name": fname,
-                "file_size": media.file_size,
-                "info": info,
-            }
-            await _bot_send_index_item(chat_id, item)
-        if found >= max_results:
+    if not scored:
+        channel_hits = await asyncio.gather(
+            *[_search_channel(ch, query, limit=5) for ch in ALLOWED_CHANNELS]
+        )
+        for hits in channel_hits:
+            for ch, m, media in hits:
+                fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
+                info = parse_media_info(fname, media.file_size, channel_id=ch)
+                item = {
+                    "id": f"{ch}:{m.id}",
+                    "channel_id": ch,
+                    "message_id": m.id,
+                    "file_name": fname,
+                    "file_size": media.file_size,
+                    "info": info,
+                }
+                s = _match_score(query, item)
+                if s > 0:
+                    scored.append((s, item))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # de-dupe
+    seen = set()
+    items = []
+    for _, item in scored:
+        key = (item.get("channel_id"), item.get("message_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+        if len(items) >= max_results:
             break
 
     if status_id:
-        if found:
+        if items:
             await bot_api("deleteMessage", chat_id=chat_id, message_id=status_id)
         else:
             await bot_api(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=status_id,
-                text=f"❌ Nothing found for **{query}** in source channels.",
+                text=f"❌ No good match for **{query}**. Try exact title, or forward the file from a source channel.",
                 parse_mode="Markdown",
             )
+            return
+
+    await bot_api(
+        "sendMessage",
+        chat_id=chat_id,
+        text=f"✅ **{len(items)}** match(es). Tap **🔗 Get link** only when you want the URL.",
+        parse_mode="Markdown",
+    )
+    for item in items:
+        await _bot_send_index_item(chat_id, item)
+
+
+def _match_score(query: str, item: dict) -> float:
+    """Require query tokens in filename/title — cuts unmatched spam."""
+    q_tokens = [t for t in re.split(r"\W+", (query or "").lower()) if len(t) > 1]
+    if not q_tokens:
+        return 0.0
+    info = item.get("info") or {}
+    hay = f"{item.get('file_name') or ''} {info.get('title') or ''}".lower()
+    hits = sum(1 for t in q_tokens if t in hay)
+    if hits == 0:
+        return 0.0
+    # Strict: all tokens, or all-but-one when query has 3+ words
+    need = len(q_tokens) if len(q_tokens) < 3 else len(q_tokens) - 1
+    if hits < need:
+        return 0.0
+    score = float(hits * 10)
+    title = (info.get("title") or "").lower()
+    if title and q_tokens[0] in title:
+        score += 5
+    if info.get("year") and str(info["year"]) in (query or ""):
+        score += 8
+    return score
+
+
+# Remember filenames for Get-link callbacks (callback_data is 64-byte capped)
+LINK_NAME_CACHE = {}
 
 
 async def _bot_send_index_item(chat_id: int, item: dict):
@@ -601,7 +640,7 @@ async def _bot_send_index_item(chat_id: int, item: dict):
     fname = item.get("file_name") or "file"
     ch = item.get("channel_id")
     mid = item.get("message_id")
-    stream_url = f"{WORKER_URL}/stream/{ch}/{mid}?name={fname}"
+    LINK_NAME_CACHE[(str(ch), str(mid))] = fname
     langs = ", ".join(info.get("languages") or ([info.get("language")] if info.get("language") else []))
     extras = []
     if info.get("year"):
@@ -624,10 +663,110 @@ async def _bot_send_index_item(chat_id: int, item: dict):
         ),
         parse_mode="Markdown",
         reply_markup=_ikb([[
-            {"text": "▶️ Stream", "url": stream_url},
+            {"text": "🔗 Get link", "callback_data": f"ln:{ch}:{mid}"},
             {"text": "💾 Cache", "callback_data": f"pw:{ch}:{mid}"},
         ]]),
     )
+
+
+def _forward_channel_ref(message: dict):
+    """Return (channel_id, message_id, title) from a forwarded channel post."""
+    origin = message.get("forward_origin") or {}
+    if origin.get("type") == "channel":
+        chat = origin.get("chat") or {}
+        return str(chat.get("id") or ""), origin.get("message_id"), chat.get("title")
+    fchat = message.get("forward_from_chat") or {}
+    if fchat.get("id") and message.get("forward_from_message_id"):
+        return str(fchat.get("id")), message.get("forward_from_message_id"), fchat.get("title")
+    return "", None, None
+
+
+def _message_file_name(message: dict) -> str:
+    for key in ("document", "video", "audio"):
+        media = message.get(key)
+        if media and media.get("file_name"):
+            return media["file_name"]
+    video = message.get("video")
+    if video:
+        return f"video_{video.get('file_unique_id', 'x')}.mp4"
+    return "stream.mkv"
+
+
+async def _bot_handle_forwarded_media(chat_id: int, message: dict):
+    """Forward from allowlisted channel → auto-cache + Get link on click."""
+    ch, mid, title = _forward_channel_ref(message)
+    if not ch or not mid:
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=(
+                "Forward the **original post from a source channel** "
+                "(not a download/re-upload). Or use `/search <title>`."
+            ),
+            parse_mode="Markdown",
+        )
+        return
+    if ch not in ALLOWED_CHANNELS:
+        await bot_api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=(
+                f"❌ Channel `{ch}` not in allowlist.\n"
+                f"Allowed: `{', '.join(ALLOWED_CHANNELS)}`"
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    fname = _message_file_name(message)
+    media = message.get("video") or message.get("document") or message.get("audio") or {}
+    fsize = media.get("file_size") or 0
+    info = parse_media_info(fname, fsize, channel_id=ch)
+    item = {
+        "id": f"{ch}:{mid}",
+        "channel_id": ch,
+        "message_id": mid,
+        "file_name": fname,
+        "file_size": fsize,
+        "info": info,
+    }
+    # Soft-add into index so later /search finds it
+    existing = {(i.get("channel_id"), i.get("message_id")) for i in (MEDIA_INDEX.get("items") or [])}
+    if (ch, mid) not in existing:
+        item["date"] = int(time.time())
+        item["popularity"] = _popularity_score(item)
+        MEDIA_INDEX.setdefault("items", []).insert(0, item)
+        MEDIA_INDEX["total"] = len(MEDIA_INDEX["items"])
+
+    await bot_api(
+        "sendMessage",
+        chat_id=chat_id,
+        text=(
+            f"📥 Got forward from **{title or ch}**\n"
+            f"🎬 `{fname}`\n"
+            f"💾 Auto-caching first ~128 MiB…"
+        ),
+        parse_mode="Markdown",
+    )
+    ok, detail = await _request_worker_prewarm(ch, str(mid), fname)
+    await bot_api(
+        "sendMessage",
+        chat_id=chat_id,
+        text=("✅ " if ok else "⚠️ ") + detail,
+        parse_mode="Markdown",
+    )
+    await _bot_send_index_item(chat_id, item)
+
+
+async def _resolve_stream_url(channel_id: str, message_id: str) -> str:
+    fname = LINK_NAME_CACHE.get((str(channel_id), str(message_id)))
+    if not fname:
+        for i in (MEDIA_INDEX.get("items") or []):
+            if str(i.get("channel_id")) == str(channel_id) and str(i.get("message_id")) == str(message_id):
+                fname = i.get("file_name")
+                break
+    fname = fname or "stream.mkv"
+    return f"{WORKER_URL}/stream/{channel_id}/{message_id}?name={fname}"
 
 
 async def _push_index_to_worker():
@@ -687,15 +826,51 @@ async def _bot_handle_callback(callback: dict):
     cq_id = callback.get("id")
     msg = callback.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
-    if cq_id:
-        await bot_api("answerCallbackQuery", callback_query_id=cq_id, text="Caching…")
+
+    if data.startswith("ln:") and chat_id:
+        parts = data.split(":")
+        if len(parts) >= 3:
+            ch, mid = parts[1], parts[2]
+            if cq_id:
+                await bot_api("answerCallbackQuery", callback_query_id=cq_id, text="Link ready")
+            url = await _resolve_stream_url(ch, mid)
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=(
+                    f"🔗 **Direct stream link**\n`{ch}:{mid}`\n\n"
+                    f"`{url}`\n\n"
+                    f"[Open stream]({url})"
+                ),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        return
+
     if data.startswith("pw:") and chat_id:
         parts = data.split(":")
         if len(parts) >= 3:
             ch, mid = parts[1], parts[2]
-            await bot_api("sendMessage", chat_id=chat_id, text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB)…", parse_mode="Markdown")
-            ok, detail = await _request_worker_prewarm(ch, mid)
-            await bot_api("sendMessage", chat_id=chat_id, text=("✅ " if ok else "❌ ") + detail, parse_mode="Markdown")
+            if cq_id:
+                await bot_api("answerCallbackQuery", callback_query_id=cq_id, text="Caching…")
+            fname = LINK_NAME_CACHE.get((str(ch), str(mid)))
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB)…",
+                parse_mode="Markdown",
+            )
+            ok, detail = await _request_worker_prewarm(ch, mid, fname)
+            await bot_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=("✅ " if ok else "❌ ") + detail,
+                parse_mode="Markdown",
+            )
+        return
+
+    if cq_id:
+        await bot_api("answerCallbackQuery", callback_query_id=cq_id)
 
 
 async def _bot_handle_message(message: dict):
@@ -704,13 +879,23 @@ async def _bot_handle_message(message: dict):
     if not chat_id:
         return
 
+    # Forwarded channel video/file → auto-cache (easiest path)
+    is_forward = bool(message.get("forward_origin") or message.get("forward_from_chat"))
+    has_media = bool(message.get("video") or message.get("document") or message.get("audio"))
+    if is_forward and has_media:
+        await _bot_handle_forwarded_media(chat_id, message)
+        return
+
     text = (message.get("text") or "").strip()
     if not text:
-        if message.get("video") or message.get("document") or message.get("audio") or message.get("forward_from_chat"):
+        if has_media:
             await bot_api(
                 "sendMessage",
                 chat_id=chat_id,
-                text="Forward a video **from a source channel**, or use `/search <title>`.",
+                text=(
+                    "To cache + stream: **forward** the post from a source channel "
+                    "(keep forward header). Or `/search <title>`."
+                ),
                 parse_mode="Markdown",
             )
         return
@@ -725,16 +910,13 @@ async def _bot_handle_message(message: dict):
             chat_id=chat_id,
             text=(
                 "🎬 **Telegram Movie Streamer Bot**\n\n"
+                "Easiest: **forward a movie** from a source channel → auto-cache.\n\n"
                 "Commands:\n"
-                "• `/tamil` — latest Tamil (+ multi)\n"
-                "• `/tamil popular` — popular Tamil\n"
-                "• `/english` — latest English\n"
-                "• `/english popular` — popular English\n"
-                "• `/multi` — multi/dual audio\n"
-                "• `/cache <ch:msg>` — cache movie before watch\n"
-                "• `/cached` — list cached titles\n"
-                "• `/index` — rebuild library index\n"
-                "• `/search <title>` — live search\n"
+                "• `/tamil` / `/english` / `/multi` — indexed lists\n"
+                "• `/cache <ch:msg>` — cache manually\n"
+                "• `/cached` — list cached\n"
+                "• `/index` — rebuild index\n"
+                "• `/search <title>` — matched search only\n"
                 "• `/channels` — source channels"
             ),
             parse_mode="Markdown",
@@ -753,12 +935,12 @@ async def _bot_handle_message(message: dict):
             chat_id=chat_id,
             text=(
                 "📖 **How to use:**\n\n"
-                "1. `/tamil` / `/english` — browse indexed lists (fast)\n"
-                "2. Tap **💾 Cache** before watch (warms first ~128 MiB)\n"
-                "3. `/cached` — see what you cached\n"
-                "4. `/search Avengers` — live channel search\n"
-                f"5. Inline: `{uname} movie title`\n"
-                "6. `/index` — refresh library index from channels"
+                "1. **Forward** a file from source channel → auto-cache\n"
+                "2. Tap **🔗 Get link** only when you need the URL\n"
+                "3. `/tamil` / `/english` — browse index\n"
+                "4. `/search Title` — strict matches only\n"
+                f"5. Inline: `{uname} title`\n"
+                "6. `/index` if lists empty"
             ),
             parse_mode="Markdown",
         )
@@ -827,8 +1009,8 @@ async def _bot_handle_message(message: dict):
                 chat_id=chat_id,
                 text=(
                     "Usage: `/cache <channel_id>:<message_id>`\n"
-                    "Or tap **💾 Cache** on a listed title.\n"
-                    "Caches first ~128 MiB so play starts fast. Rest fills while watching."
+                    "Or **forward** the file from a source channel (auto-cache).\n"
+                    "Or tap **💾 Cache** on a listed title."
                 ),
                 parse_mode="Markdown",
             )
@@ -837,7 +1019,7 @@ async def _bot_handle_message(message: dict):
         await bot_api(
             "sendMessage",
             chat_id=chat_id,
-            text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB, list stays in KV)…",
+            text=f"💾 Caching `{ch}:{mid}` (first ~128 MiB)…",
             parse_mode="Markdown",
         )
         ok, detail = await _request_worker_prewarm(ch.strip(), mid.strip())
@@ -856,7 +1038,7 @@ async def _bot_handle_message(message: dict):
             await bot_api(
                 "sendMessage",
                 chat_id=chat_id,
-                text="📭 Nothing cached yet. Use `/tamil` then tap **💾 Cache**.",
+                text="📭 Nothing cached yet. **Forward** a file from a source channel.",
                 parse_mode="Markdown",
             )
             return
@@ -906,38 +1088,69 @@ async def _bot_handle_inline(inline_query: dict):
         await bot_api("answerInlineQuery", inline_query_id=iq_id, results=[], cache_time=5)
         return
 
-    # Parallel channel search; no TMDB — answerInlineQuery has a ~10s budget.
-    channel_hits = await asyncio.gather(
-        *[_search_channel(ch, q, limit=4) for ch in ALLOWED_CHANNELS]
-    )
+    # Prefer strict index matches first
+    scored = []
+    for i in (MEDIA_INDEX.get("items") or []):
+        s = _match_score(q, i)
+        if s > 0:
+            scored.append((s, i))
+    if not scored:
+        channel_hits = await asyncio.gather(
+            *[_search_channel(ch, q, limit=4) for ch in ALLOWED_CHANNELS]
+        )
+        for hits in channel_hits:
+            for ch, m, media in hits:
+                fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
+                info = parse_media_info(fname, media.file_size, channel_id=ch)
+                item = {
+                    "id": f"{ch}:{m.id}",
+                    "channel_id": ch,
+                    "message_id": m.id,
+                    "file_name": fname,
+                    "info": info,
+                }
+                s = _match_score(q, item)
+                if s > 0:
+                    scored.append((s, item))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
     results = []
-    for hits in channel_hits:
-        for ch, m, media in hits:
-            if len(results) >= 8:
-                break
-            fname = getattr(media, "file_name", None) or f"file_{m.id}.mp4"
-            info = parse_media_info(fname, media.file_size)
-            url = f"{WORKER_URL}/stream/{ch}/{m.id}?name={fname}"
-            desc_parts = [p for p in [info["quality"], info.get("source"), info["size"]] if p and p != "Unknown"]
-            desc = " | ".join(desc_parts)
-            if info.get("year"):
-                desc = f"{info['year']} · {desc}"
-            results.append({
-                "type": "article",
-                "id": f"{ch}_{m.id}",
-                "title": (info.get("title") or fname)[:64],
-                "description": desc[:120],
-                "input_message_content": {
-                    "message_text": (
-                        f"🎬 **{fname}**\n"
-                        f"📌 {info['quality']} | {info.get('source', '?')} | 📦 {info['size']}\n"
-                        f"🔗 {url}"
-                    ),
-                    "parse_mode": "Markdown",
-                },
-                "reply_markup": _ikb([[{"text": "▶️ Stream Now", "url": url}]]),
-            })
-        if len(results) >= 8:
+    seen = set()
+    for _, item in scored:
+        ch, mid = item["channel_id"], item["message_id"]
+        key = (ch, mid)
+        if key in seen:
+            continue
+        seen.add(key)
+        fname = item.get("file_name") or f"file_{mid}.mp4"
+        info = item.get("info") or {}
+        LINK_NAME_CACHE[(str(ch), str(mid))] = fname
+        desc_parts = [p for p in [info.get("quality"), info.get("source"), info.get("size")] if p and p != "Unknown"]
+        desc = " | ".join(desc_parts)
+        if info.get("year"):
+            desc = f"{info['year']} · {desc}"
+        # No raw URL in text — open bot / Get link pattern via url button only when user picks result
+        url = f"{WORKER_URL}/stream/{ch}/{mid}?name={fname}"
+        results.append({
+            "type": "article",
+            "id": f"{ch}_{mid}",
+            "title": (info.get("title") or fname)[:64],
+            "description": desc[:120],
+            "input_message_content": {
+                "message_text": (
+                    f"🎬 **{(info.get('title') or fname)[:80]}**\n"
+                    f"📌 {info.get('quality', '?')} | {info.get('source', '?')} | 📦 {info.get('size', '?')}\n"
+                    f"`{ch}:{mid}`\n"
+                    f"Tap button for stream link."
+                ),
+                "parse_mode": "Markdown",
+            },
+            "reply_markup": _ikb([[
+                {"text": "🔗 Get link", "url": url},
+                {"text": "💬 Open bot", "url": f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WORKER_URL},
+            ]]),
+        })
+        if len(results) >= 5:
             break
 
     await bot_api("answerInlineQuery", inline_query_id=iq_id, results=results, cache_time=60)
