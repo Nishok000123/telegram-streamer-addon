@@ -12,7 +12,7 @@ API_ID_RAW = os.environ.get("API_ID", "").strip()
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.pages.dev").rstrip('/')
+WORKER_URL = os.environ.get("WORKER_URL", "https://telegram-streamer-addon.nishokroshan076632.workers.dev").rstrip('/')
 
 ALLOWED_CHANNELS = [c.strip() for c in os.environ.get("ALLOWED_CHANNELS", "-1003967652604,-1002502061360,-1003916531716").split(",") if c.strip()]
 
@@ -221,9 +221,6 @@ if tg_client:
 
         await inline_query.answer(results, cache_time=300)
 
-
-# ================= FASTAPI WEB API ENDPOINTS =================
-
 @app.on_event("startup")
 async def startup():
     print("🚀 Starting Telegram MTProto Engine & Bot Handlers...")
@@ -245,9 +242,9 @@ def health_check():
         "status": "online",
         "engine": "Hydrogram MTProto Direct Streamer & Telegram Bot Interface",
         "version": "3.0.0",
+        "worker_url": WORKER_URL,
         "bot_active": tg_client is not None,
-        "channels": ALLOWED_CHANNELS,
-        "features": ["Bot /start", "/search", "Inline Query", "Auto Forward Link Generator"]
+        "channels": ALLOWED_CHANNELS
     }
 
 @app.get("/health")
