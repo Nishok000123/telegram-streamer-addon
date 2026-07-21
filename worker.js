@@ -50,7 +50,7 @@ export default {
 function stremioManifest() {
   return new Response(JSON.stringify({
     id: 'io.darkwave.stream',
-    version: '5.0.0',
+    version: '5.0.1',
     name: '🌊 DarkWave Stream',
     description: 'Telegram stream sources for movies & series — no catalog, sources only.',
     logo: 'https://i.imgur.com/5ZNRcqH.png',
@@ -164,10 +164,32 @@ function matchesMeta(item, name, year, season, episode, type) {
   const fname = (item.file_name || '').toLowerCase();
   const info = item.info || {};
   const title = (info.title || '').toLowerCase();
-  const tokens = String(name).toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter((t) => t.length > 2);
   const hay = `${fname} ${title}`;
-  const hit = tokens.length === 0 || tokens.every((t) => hay.includes(t));
-  if (!hit) return false;
+
+  const isEpisode = /s\s*\d{1,2}\s*e\s*\d{1,2}|\d{1,2}\s*x\s*\d{1,2}/i.test(fname)
+    || info.media_type === 'series';
+  if (type === 'movie' && isEpisode) return false;
+
+  const tokens = String(name).toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter((t) => t.length > 1);
+  if (!tokens.length) return false;
+  for (const t of tokens) {
+    if (!new RegExp(`(?:^|[^a-z0-9])${escapeRe(t)}(?:[^a-z0-9]|$)`, 'i').test(hay)) return false;
+  }
+
+  // Block "Sharp Obsession" / "Dark Obsession" when query is just "Obsession"
+  if (tokens.length === 1) {
+    const t = tokens[0];
+    const stripped = hay
+      .replace(/\[[^\]]*]/g, ' ')
+      .replace(/\([^)]*\)/g, ' ')
+      .replace(/\.(mkv|mp4|avi|mov|m4v|webm)$/i, ' ');
+    const m = stripped.match(new RegExp(`(?:^|[^a-z0-9])([a-z]{2,}(?:[._\\s-]+[a-z0-9]+){0,4})[._\\s-]+${escapeRe(t)}(?:[^a-z0-9]|$)`, 'i'));
+    if (m && m[1]) {
+      const prefix = m[1].toLowerCase().replace(/[._-]+/g, ' ').trim();
+      const allowed = new Set(['the', 'a', 'an']);
+      if (![...prefix.split(/\s+/)].every((w) => allowed.has(w))) return false;
+    }
+  }
 
   if (type === 'series' && season != null && episode != null) {
     if (info.season != null && info.episode != null) {
@@ -178,12 +200,16 @@ function matchesMeta(item, name, year, season, episode, type) {
     return new RegExp(`s\\s*${s}\\s*e\\s*${e}|${Number(season)}\\s*x\\s*${e}`, 'i').test(fname);
   }
 
-  if (year && info.year && String(info.year) !== String(year)) {
-    // Soft filter: keep if filename has no other year conflict
-    if (fname.includes(String(year))) return true;
-    return Math.abs(Number(info.year) - Number(year)) <= 1;
+  if (year) {
+    const y = String(year);
+    const yearsInName = fname.match(/\b(?:19|20)\d{2}\b/g) || [];
+    if (yearsInName.length && !yearsInName.includes(y)) return false;
   }
   return true;
+}
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function makeStream(origin, channelId, messageId, name, title, fileName) {
